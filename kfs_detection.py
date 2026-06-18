@@ -155,8 +155,11 @@ class KFSDetector:
         self.min_box_clarity = cfg.get("min_box_clarity", 100)
         self.debug_max_lookahead_frames = cfg.get("debug_max_lookahead_frames", 30)
         self.min_symbol_area = cfg.get("min_symbol_area", 30)
+        self.min_symbol_group_area = cfg.get("min_symbol_group_area", 90)
         self.symbol_border_margin = cfg.get("symbol_border_margin", 14)
         self.face_pad_frac = cfg.get("face_pad_frac", 0.45)
+        self.symbol_group_close = cfg.get("symbol_group_close", 13)
+        self.debug_verbose = cfg.get("debug_verbose", False)
 
         # --- real/fake (endpoint sharpness logic) ---
         self.stroke_thresh  = cfg.get("stroke_thresh", 80)
@@ -170,9 +173,10 @@ class KFSDetector:
         self.kfs_min_area   = cfg.get("kfs_min_area", 4000)
         self.dedup_dist     = cfg.get("dedup_dist", 5)
         self.close_kernel   = cfg.get("close_kernel", 15)
-        self.sharp_end_angle_thresh = cfg.get("sharp_end_angle_thresh", 85)
-        self.endpoint_branch_ignore_radius = cfg.get("endpoint_branch_ignore_radius", 10)
+        self.sharp_end_angle_thresh = cfg.get("sharp_end_angle_thresh", 95)
+        self.endpoint_branch_ignore_radius = cfg.get("endpoint_branch_ignore_radius", 16)
         self.endpoint_tip_radius = cfg.get("endpoint_tip_radius", 10)
+        self.endpoint_merge_radius = cfg.get("endpoint_merge_radius", 8)
 
         # --- localisation / association ---
         self.assoc_dist     = cfg.get("assoc_dist", 0.30)  # m, same-box matching
@@ -421,17 +425,27 @@ class KFSDetector:
     def _symbol_mask(self, bgr, object_mask=None):
         """Mask white/black markings against a red/blue box face."""
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        color_mask = self._color_masks(bgr)["ALL"]
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        color_mask = self._color_masks(bgr)["ALL"] > 0
         if object_mask is None:
             valid = np.ones(gray.shape, bool)
         else:
             valid = object_mask > 0
 
-        non_box = valid & (color_mask == 0)
-        white = (gray > 135) & non_box
-        black = (gray < 70) & non_box
-        mask = (white | black).astype(np.uint8) * 255
-        mask = self._clean_binary(mask, open_size=3, close_size=5)
+        greenish = (hue >= 35) & (hue <= 90) & (sat > 45) & (val > 45)
+        saturated_bg = (sat > 150) & (val > 55) & (val < 170)
+        neutral = valid & (~color_mask) & (~greenish) & (~saturated_bg)
+
+        local = cv2.GaussianBlur(gray, (0, 0), 5)
+        high_contrast = cv2.absdiff(gray, local) > 18
+        white = ((val > 135) | ((gray > 105) & high_contrast)) & (sat < 175)
+        black = ((val < 75) | ((gray < 105) & high_contrast)) & (sat < 150)
+        mask = ((white | black) & neutral).astype(np.uint8) * 255
+        mask = self._clean_binary(mask, open_size=3, close_size=7)
+
+        bridge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, bridge)
 
         cleaned = np.zeros_like(mask)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
@@ -441,94 +455,257 @@ class KFSDetector:
             if cv2.contourArea(cnt) < self.min_symbol_area:
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
-            m = self.symbol_border_margin
-            if x <= m or y <= m or x + w >= W - m or y + h >= H - m:
-                continue
+            m = min(self.symbol_border_margin, max(4, min(H, W) // 20))
+            touches_border = (
+                x <= m or y <= m or x + w >= W - m or y + h >= H - m
+            )
+            if touches_border:
+                if object_mask is not None:
+                    continue
+                if cv2.contourArea(cnt) < 500 or min(w, h) < 12:
+                    continue
             cv2.drawContours(cleaned, [cnt], -1, 255, cv2.FILLED)
         return cleaned
 
-    def _symbol_center(self, symbol_mask):
-        contours, _ = cv2.findContours(symbol_mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None, 0
-        cnt = max(contours, key=cv2.contourArea)
-        area = float(cv2.contourArea(cnt))
-        if area < self.min_symbol_area:
-            return None, area
-        m = cv2.moments(cnt)
-        if m["m00"] == 0:
-            x, y, w, h = cv2.boundingRect(cnt)
-            return (x + w / 2.0, y + h / 2.0), area
-        return (m["m10"] / m["m00"], m["m01"] / m["m00"]), area
+    def _symbol_groups(self, symbol_mask):
+        """Group fragmented strokes into one mask per visible marking."""
+        if cv2.countNonZero(symbol_mask) < self.min_symbol_area:
+            return []
 
-    def _face_edges(self, crop, object_mask):
+        k = max(3, int(self.symbol_group_close) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        grouped = cv2.morphologyEx(symbol_mask, cv2.MORPH_CLOSE, kernel)
+        grouped = cv2.dilate(
+            grouped,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1)
+
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (grouped > 0).astype(np.uint8), 8)
+        groups = []
+        for label in range(1, n):
+            x, y, w, h, _ = stats[label]
+            component = labels == label
+            mask = np.zeros_like(symbol_mask)
+            mask[component & (symbol_mask > 0)] = 255
+            area = int(cv2.countNonZero(mask))
+            if area < self.min_symbol_group_area:
+                continue
+            ys, xs = np.nonzero(mask)
+            if len(xs) == 0:
+                continue
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            groups.append({
+                "mask": mask,
+                "bbox": (x0, y0, x1 - x0, y1 - y0),
+                "center": (float(xs.mean()), float(ys.mean())),
+                "area": float(area),
+            })
+
+        groups.sort(key=lambda g: (g["bbox"][1], g["bbox"][0]))
+        return groups
+
+    def _same_color_face_mask(self, crop, object_mask, color_name):
+        masks = self._color_masks(crop)
+        color = masks.get(color_name, masks["ALL"])
+        color = self._clean_binary(color, open_size=3, close_size=15)
+        color = cv2.dilate(
+            color,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1)
+        if object_mask is not None:
+            obj = cv2.dilate(
+                object_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                iterations=1)
+            color = cv2.bitwise_and(color, obj)
+        return color
+
+    @staticmethod
+    def _mask_center(symbol_mask):
+        ys, xs = np.nonzero(symbol_mask > 0)
+        if len(xs) == 0:
+            return None, 0
+        return (float(xs.mean()), float(ys.mean())), int(len(xs))
+
+    @staticmethod
+    def _merge_positions(values, tol=8):
+        if not values:
+            return []
+        vals = sorted(float(v) for v in values)
+        groups = [[vals[0]]]
+        for v in vals[1:]:
+            if abs(v - groups[-1][-1]) <= tol:
+                groups[-1].append(v)
+            else:
+                groups.append([v])
+        return [float(np.mean(g)) for g in groups]
+
+    def _vertical_face_boundaries(self, edges, color_mask, groups):
+        ys, xs = np.nonzero(color_mask > 0)
+        if len(xs) == 0:
+            return []
+
+        verticals = [float(xs.min()), float(xs.max())]
+        lines = cv2.HoughLinesP(
+            edges, 1, np.pi / 180, threshold=18,
+            minLineLength=max(12, min(edges.shape[:2]) // 4),
+            maxLineGap=10)
+        if lines is not None:
+            for x1, y1, x2, y2 in lines[:, 0, :]:
+                dx, dy = float(x2 - x1), float(y2 - y1)
+                length = np.hypot(dx, dy)
+                if length < 12:
+                    continue
+                if abs(dx) < abs(dy) * 0.65:
+                    verticals.append((float(x1) + float(x2)) / 2.0)
+
+        by_x = sorted(groups, key=lambda g: g["bbox"][0])
+        for a, b in zip(by_x, by_x[1:]):
+            ax, _, aw, _ = a["bbox"]
+            bx, _, _, _ = b["bbox"]
+            gap = bx - (ax + aw)
+            if gap > max(12, self.symbol_group_close):
+                verticals.append(ax + aw + gap / 2.0)
+        return self._merge_positions(verticals)
+
+    @staticmethod
+    def _quad_bbox(quad):
+        q = np.asarray(quad, dtype=np.float32)
+        x0, y0 = q.min(axis=0)
+        x1, y1 = q.max(axis=0)
+        return float(x0), float(y0), float(x1), float(y1)
+
+    @staticmethod
+    def _bbox_iou(a, b):
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+        ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+        iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+        inter = iw * ih
+        area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+        area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+        return inter / max(1e-6, area_a + area_b - inter)
+
+    def _fallback_symbol_quad(self, group, color_mask):
+        H, W = color_mask.shape
+        x, y, w, h = group["bbox"]
+        pad = int(max(w, h) * self.face_pad_frac)
+
+        ys, xs = np.nonzero(color_mask > 0)
+        if len(xs) > 0:
+            bx0, bx1 = int(xs.min()), int(xs.max())
+            by0, by1 = int(ys.min()), int(ys.max())
+        else:
+            bx0, by0, bx1, by1 = 0, 0, W - 1, H - 1
+
+        x0 = max(bx0, x - pad, 0)
+        y0 = max(by0, y - pad, 0)
+        x1 = min(bx1, x + w + pad, W - 1)
+        y1 = min(by1, y + h + pad, H - 1)
+        return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+                        dtype=np.float32)
+
+    def _quad_from_color_region(self, color_mask, group, boundaries):
+        cx, _ = group["center"]
+        H, W = color_mask.shape
+        lefts = [b for b in boundaries if b < cx - 2]
+        rights = [b for b in boundaries if b > cx + 2]
+        if lefts and rights:
+            x0 = max(0, int(round(max(lefts))) - 2)
+            x1 = min(W - 1, int(round(min(rights))) + 2)
+        else:
+            return self._fallback_symbol_quad(group, color_mask), "symbol_rect_fallback"
+
+        if x1 - x0 < max(16, group["bbox"][2]):
+            return self._fallback_symbol_quad(group, color_mask), "symbol_rect_fallback"
+
+        band = np.zeros_like(color_mask)
+        band[:, x0:x1 + 1] = color_mask[:, x0:x1 + 1]
+        band = cv2.morphologyEx(
+            band, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+
+        group_touch = cv2.dilate(
+            group["mask"],
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+        contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        best_score = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.min_face_px:
+                continue
+            component = np.zeros_like(color_mask)
+            cv2.drawContours(component, [cnt], -1, 255, cv2.FILLED)
+            overlap = cv2.countNonZero(cv2.bitwise_and(component, group_touch))
+            if overlap > best_score:
+                best = cnt
+                best_score = overlap
+
+        if best is None:
+            return self._fallback_symbol_quad(group, color_mask), "symbol_rect_fallback"
+
+        peri = cv2.arcLength(best, True)
+        approx = cv2.approxPolyDP(best, 0.035 * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            quad = approx[:, 0, :].astype(np.float32)
+            return self._order_quad(quad), "color_face_contour"
+
+        hull = cv2.convexHull(best)
+        if len(hull) >= 4:
+            quad = hull[:, 0, :].astype(np.float32)
+            return self._order_quad(quad), "color_face_hull"
+
+        rect = cv2.minAreaRect(best)
+        quad = cv2.boxPoints(rect).astype(np.float32)
+        return self._order_quad(quad), "color_face_rect"
+
+    def _face_edges(self, crop, object_mask, symbol_mask=None):
+        if object_mask is None:
+            object_mask = np.ones(crop.shape[:2], np.uint8) * 255
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         masked = cv2.bitwise_and(gray, gray, mask=object_mask)
         masked = cv2.GaussianBlur(masked, (3, 3), 0)
-        edges = cv2.Canny(masked, 50, 140)
+        edges = cv2.Canny(masked, 45, 135)
+        mask_edges = cv2.Canny(object_mask, 40, 120)
+        edges = cv2.bitwise_or(edges, mask_edges)
         edges = cv2.bitwise_and(edges, edges, mask=object_mask)
+        if symbol_mask is not None:
+            symbol_zone = cv2.dilate(
+                symbol_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+            edges[symbol_zone > 0] = 0
         return edges
 
-    def _quad_from_edges(self, edges, symbol_mask, object_mask):
-        center, symbol_area = self._symbol_center(symbol_mask)
-        if center is None:
-            return None, "no_symbol", symbol_area
-        cx, cy = center
-        H, W = edges.shape
+    def _quad_debug_image(self, crop, faces, symbol_mask, edges, groups):
+        img = crop.copy()
+        if edges is not None:
+            img[edges > 0] = (0, 255, 0)
+        if symbol_mask is not None:
+            img[symbol_mask > 0] = (255, 255, 255)
+        palette = [(0, 255, 255), (255, 0, 255), (0, 180, 255),
+                   (255, 255, 0)]
+        for idx, group in enumerate(groups):
+            color = palette[idx % len(palette)]
+            x, y, w, h = group["bbox"]
+            cv2.rectangle(img, (x, y), (x + w, y + h), color, 1)
+        for idx, face in enumerate(faces):
+            color = palette[idx % len(palette)]
+            q = np.round(np.asarray(face["quad"], dtype=np.float32)).astype(int)
+            cv2.polylines(img, [q], True, color, 2)
+            cx = int(np.mean(q[:, 0]))
+            cy = int(np.mean(q[:, 1]))
+            cv2.putText(img, str(idx), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, color, 2, cv2.LINE_AA)
+        return img
 
-        line_edges = edges.copy()
-        symbol_zone = cv2.dilate(
-            symbol_mask,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
-        line_edges[symbol_zone > 0] = 0
-
-        lines = cv2.HoughLinesP(line_edges, 1, np.pi / 180, threshold=20,
-                                minLineLength=max(12, min(W, H) // 5),
-                                maxLineGap=12)
-        left = right = top = bottom = None
-        if lines is not None:
-            for line in lines[:, 0, :]:
-                x1, y1, x2, y2 = [float(v) for v in line]
-                dx, dy = x2 - x1, y2 - y1
-                length = np.hypot(dx, dy)
-                if length < 10:
-                    continue
-                if abs(dx) < abs(dy) * 0.55:
-                    x = (x1 + x2) / 2.0
-                    if x < cx and (left is None or x < left):
-                        left = x
-                    if x > cx and (right is None or x > right):
-                        right = x
-                elif abs(dy) < abs(dx) * 0.55:
-                    y = (y1 + y2) / 2.0
-                    if y < cy and (top is None or y < top):
-                        top = y
-                    if y > cy and (bottom is None or y > bottom):
-                        bottom = y
-
-        if None not in (left, right, top, bottom):
-            margin = 4.0
-            quad = np.array([
-                [max(0, left - margin), max(0, top - margin)],
-                [min(W - 1, right + margin), max(0, top - margin)],
-                [min(W - 1, right + margin), min(H - 1, bottom + margin)],
-                [max(0, left - margin), min(H - 1, bottom + margin)],
-            ], dtype=np.float32)
-            return self._order_quad(quad), "edge_lines", symbol_area
-
-        contours, _ = cv2.findContours(symbol_mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
-        else:
-            x, y, w, h = cv2.boundingRect(object_mask)
-        pad = int(max(w, h) * self.face_pad_frac)
-        x0, y0 = max(0, x - pad), max(0, y - pad)
-        x1, y1 = min(W - 1, x + w + pad), min(H - 1, y + h + pad)
-        quad = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
-                        dtype=np.float32)
-        return quad, "symbol_rect_fallback", symbol_area
+    def _symbol_center(self, symbol_mask):
+        center, area = self._mask_center(symbol_mask)
+        return center, float(area)
 
     def _warp_quad(self, crop, quad):
         S = self.out_size
@@ -537,17 +714,8 @@ class KFSDetector:
         M = cv2.getPerspectiveTransform(self._order_quad(quad), dst)
         return cv2.warpPerspective(crop, M, (S, S))
 
-    def _quad_debug_image(self, crop, quad, symbol_mask, edges):
-        img = crop.copy()
-        if quad is not None:
-            q = np.round(quad).astype(int)
-            cv2.polylines(img, [q], True, (0, 255, 255), 2)
-        img[edges > 0] = (0, 255, 0)
-        img[symbol_mask > 0] = (255, 255, 255)
-        return img
-
     def flatten_faces(self, box, intr, depth_scale=0.001):
-        """Rectify the visible marked face with a simple 2D perspective warp.
+        """Rectify each visible marked face with a 2D perspective warp.
 
         Returns a list of face dicts:
             {image, quad, method, clarity_score, symbol_area}
@@ -559,23 +727,45 @@ class KFSDetector:
             return []
 
         symbol_mask = self._symbol_mask(crop, object_mask)
-        edges = self._face_edges(crop, object_mask)
-        quad, method, symbol_area = self._quad_from_edges(
-            edges, symbol_mask, object_mask)
-        if quad is None:
+        groups = self._symbol_groups(symbol_mask)
+        if not groups:
             return []
 
-        image = self._warp_quad(crop, quad)
-        return [{
-            "image": image,
-            "quad": [[float(x), float(y)] for x, y in quad],
-            "method": method,
-            "clarity_score": clarity,
-            "symbol_area": float(symbol_area),
-            "symbol_mask": symbol_mask,
-            "edges": edges,
-            "quad_debug": self._quad_debug_image(crop, quad, symbol_mask, edges),
-        }]
+        color_mask = self._same_color_face_mask(
+            crop, object_mask, box.get("color", "ALL"))
+        if cv2.countNonZero(color_mask) < self.min_face_px:
+            return []
+
+        edges = self._face_edges(crop, color_mask, symbol_mask)
+        boundaries = self._vertical_face_boundaries(edges, color_mask, groups)
+        faces = []
+        used = []
+        for group in groups:
+            quad, method = self._quad_from_color_region(
+                color_mask, group, boundaries)
+            bbox = self._quad_bbox(quad)
+            if any(self._bbox_iou(bbox, prev) > 0.82 for prev in used):
+                continue
+            image = self._warp_quad(crop, quad)
+            if image is None or image.size == 0:
+                continue
+            used.append(bbox)
+            faces.append({
+                "image": image,
+                "quad": [[float(x), float(y)] for x, y in quad],
+                "method": method,
+                "clarity_score": clarity,
+                "symbol_area": float(group["area"]),
+                "symbol_mask": symbol_mask,
+                "symbol_group": group["mask"],
+                "edges": edges,
+            })
+
+        if faces:
+            debug = self._quad_debug_image(crop, faces, symbol_mask, edges, groups)
+            for face in faces:
+                face["quad_debug"] = debug
+        return faces
 
     # ════════════════════════════════════════════════════════════════════════
     # 3. CLASSIFY FACE  (2D corner/anchor logic ported from the prototypes)
@@ -699,14 +889,141 @@ class KFSDetector:
         return float(np.degrees(np.arccos(np.clip(np.dot(v1, v2) / (n1 * n2),
                                                   -1, 1))))
 
+    @staticmethod
+    def _cluster_points(points, radius):
+        if not points:
+            return []
+        remaining = [np.array(p, dtype=np.float32) for p in points]
+        clusters = []
+        while remaining:
+            seed = remaining.pop(0)
+            cluster = [seed]
+            changed = True
+            while changed:
+                changed = False
+                keep = []
+                center = np.mean(cluster, axis=0)
+                for pt in remaining:
+                    if np.linalg.norm(pt - center) <= radius:
+                        cluster.append(pt)
+                        changed = True
+                    else:
+                        keep.append(pt)
+                remaining = keep
+            center = np.mean(cluster, axis=0)
+            clusters.append((int(round(center[0])), int(round(center[1]))))
+        return clusters
+
+    @staticmethod
+    def _nearest_contour_point(symbol_mask, point):
+        contours, _ = cv2.findContours(symbol_mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return point
+        target = np.array(point, dtype=np.float32)
+        best_pt = None
+        best_dist = None
+        for cnt in contours:
+            pts = cnt[:, 0, :].astype(np.float32)
+            dists = np.linalg.norm(pts - target, axis=1)
+            idx = int(np.argmin(dists))
+            dist = float(dists[idx])
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_pt = pts[idx]
+        if best_pt is None:
+            return point
+        return (int(round(best_pt[0])), int(round(best_pt[1])))
+
+    @staticmethod
+    def _point_segment_distance(point, a, b):
+        p = np.array(point, dtype=np.float32)
+        a = np.array(a, dtype=np.float32)
+        b = np.array(b, dtype=np.float32)
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        if denom <= 1e-6:
+            return float(np.linalg.norm(p - a))
+        t = float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
+        proj = a + t * ab
+        return float(np.linalg.norm(p - proj))
+
+    def _near_symbol_hull(self, symbol_mask, point, max_dist):
+        contours, _ = cv2.findContours(symbol_mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return False
+        best = None
+        for cnt in contours:
+            if cv2.contourArea(cnt) < self.min_symbol_area:
+                continue
+            hull = cv2.convexHull(cnt)[:, 0, :]
+            if len(hull) < 2:
+                continue
+            for i in range(len(hull)):
+                dist = self._point_segment_distance(
+                    point, hull[i], hull[(i + 1) % len(hull)])
+                if best is None or dist < best:
+                    best = dist
+        return best is not None and best <= max_dist
+
+    def _endpoint_candidates(self, symbol_mask, skeleton):
+        skel_bool = skeleton > 0
+        kernel = np.ones((3, 3), np.uint8)
+        neighbor_count = cv2.filter2D(skel_bool.astype(np.uint8), -1, kernel)
+        neighbor_count = neighbor_count - skel_bool.astype(np.uint8)
+
+        branch_mask = skel_bool & (neighbor_count >= 5)
+        branch_u8 = branch_mask.astype(np.uint8) * 255
+        ignored_intersections = []
+        if cv2.countNonZero(branch_u8) > 0:
+            n, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                branch_u8, 8)
+            for label in range(1, n):
+                if stats[label, cv2.CC_STAT_AREA] < 2:
+                    continue
+                cx, cy = centroids[label]
+                ignored_intersections.append((int(round(cx)), int(round(cy))))
+            r = self.endpoint_branch_ignore_radius
+            branch_zone = cv2.dilate(
+                branch_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (2 * r + 1, 2 * r + 1)))
+        else:
+            branch_zone = np.zeros_like(skeleton)
+
+        endpoint_mask = skel_bool & (neighbor_count == 1) & (branch_zone == 0)
+        ey, ex = np.nonzero(endpoint_mask)
+        medial_points = list(zip(ex.tolist(), ey.tolist()))
+        merged = self._cluster_points(medial_points, self.endpoint_merge_radius)
+        contour_points = [self._nearest_contour_point(symbol_mask, pt)
+                          for pt in merged]
+        endpoints = self._cluster_points(contour_points,
+                                         self.endpoint_merge_radius)
+        endpoints = [
+            pt for pt in endpoints
+            if self._near_symbol_hull(
+                symbol_mask, pt, max(8, int(self.endpoint_tip_radius * 1.4)))
+        ]
+        ignored_intersections = self._cluster_points(
+            ignored_intersections, self.endpoint_merge_radius)
+        return endpoints, ignored_intersections
+
     def _endpoint_debug_image(self, face_img, symbol_mask, skeleton,
-                              endpoints, branches, sharp_points):
+                              endpoints, ignored_intersections, sharp_points,
+                              round_points):
         dbg = face_img.copy()
         dbg[skeleton > 0] = (0, 255, 255)
-        for x, y in branches:
-            cv2.circle(dbg, (int(x), int(y)), 4, (0, 0, 255), -1)
+        for x, y in ignored_intersections:
+            cv2.circle(dbg, (int(x), int(y)), 6, (0, 0, 255), 2)
+            cv2.line(dbg, (int(x) - 5, int(y) - 5),
+                     (int(x) + 5, int(y) + 5), (0, 0, 255), 1)
+            cv2.line(dbg, (int(x) - 5, int(y) + 5),
+                     (int(x) + 5, int(y) - 5), (0, 0, 255), 1)
         for x, y in endpoints:
             cv2.circle(dbg, (int(x), int(y)), 4, (0, 255, 0), -1)
+        for x, y in round_points:
+            cv2.circle(dbg, (int(x), int(y)), 7, (255, 0, 0), 2)
         for x, y in sharp_points:
             cv2.circle(dbg, (int(x), int(y)), 7, (0, 255, 255), 2)
         return dbg
@@ -724,6 +1041,8 @@ class KFSDetector:
                 "round_end_count": 0,
                 "branch_count": 0,
                 "endpoint_count": 0,
+                "endpoint_candidates": [],
+                "ignored_intersections": [],
             }
 
         symbol_mask = self._symbol_mask(face_img)
@@ -735,39 +1054,23 @@ class KFSDetector:
                 "round_end_count": 0,
                 "branch_count": 0,
                 "endpoint_count": 0,
+                "endpoint_candidates": [],
+                "ignored_intersections": [],
                 "symbol_mask": symbol_mask,
             }
 
         skeleton = self._skeletonize(symbol_mask)
-        skel_bool = skeleton > 0
-        kernel = np.ones((3, 3), np.uint8)
-        neighbor_count = cv2.filter2D(skel_bool.astype(np.uint8), -1, kernel)
-        neighbor_count = neighbor_count - skel_bool.astype(np.uint8)
-
-        endpoint_mask = skel_bool & (neighbor_count == 1)
-        branch_mask = skel_bool & (neighbor_count >= 3)
-        branch_u8 = branch_mask.astype(np.uint8) * 255
-        if cv2.countNonZero(branch_u8) > 0:
-            r = self.endpoint_branch_ignore_radius
-            branch_zone = cv2.dilate(
-                branch_u8,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                          (2 * r + 1, 2 * r + 1)))
-            endpoint_mask &= branch_zone == 0
-
-        ey, ex = np.nonzero(endpoint_mask)
-        by, bx = np.nonzero(branch_mask)
-        endpoints = list(zip(ex.tolist(), ey.tolist()))
-        branches = list(zip(bx.tolist(), by.tolist()))
+        endpoints, ignored_intersections = self._endpoint_candidates(
+            symbol_mask, skeleton)
 
         sharp_points = []
-        round_count = 0
+        round_points = []
         for pt in endpoints:
             angle = self._endpoint_angle(symbol_mask, pt)
             if angle is not None and angle <= self.sharp_end_angle_thresh:
                 sharp_points.append(pt)
             else:
-                round_count += 1
+                round_points.append(pt)
 
         if not endpoints:
             label = "NONE"
@@ -777,14 +1080,19 @@ class KFSDetector:
             label = "FAKE"
 
         endpoint_debug = self._endpoint_debug_image(
-            face_img, symbol_mask, skeleton, endpoints, branches, sharp_points)
+            face_img, symbol_mask, skeleton, endpoints, ignored_intersections,
+            sharp_points, round_points)
         return label, {
             "valid_count": len(sharp_points),
             "n_corners": len(endpoints),
             "sharp_end_count": len(sharp_points),
-            "round_end_count": int(round_count),
-            "branch_count": len(branches),
+            "round_end_count": len(round_points),
+            "branch_count": len(ignored_intersections),
             "endpoint_count": len(endpoints),
+            "endpoint_candidates": [[int(x), int(y)] for x, y in endpoints],
+            "ignored_intersections": [
+                [int(x), int(y)] for x, y in ignored_intersections
+            ],
             "symbol_mask": symbol_mask,
             "skeleton": skeleton,
             "endpoints_image": endpoint_debug,
@@ -828,6 +1136,8 @@ class KFSDetector:
         for box in self.detect_boxes(rgb, depth, depth_scale):
             loc = self.find_location(box, intr, depth_scale)
             faces = self.flatten_faces(box, intr, depth_scale)
+            if not faces:
+                continue
             face_results = []
             for face in faces:
                 label, info = self.classify_face(face["image"])
@@ -838,6 +1148,8 @@ class KFSDetector:
                     "round_end_count": int(info["round_end_count"]),
                     "branch_count": int(info["branch_count"]),
                     "endpoint_count": int(info["endpoint_count"]),
+                    "endpoint_candidates": info.get("endpoint_candidates", []),
+                    "ignored_intersections": info.get("ignored_intersections", []),
                     "quad": face["quad"],
                     "method": face["method"],
                     "clarity_score": float(face["clarity_score"]),
@@ -888,54 +1200,52 @@ class KFSDetector:
         frame_clarity = self.clarity_score(rgb)
 
         color_path = out_dir / "color.png"
-        depth_path = out_dir / "depth.png"
         overlay_path = out_dir / "boxes_overlay.png"
-        blue_mask_path = out_dir / "blue_mask.png"
-        red_mask_path = out_dir / "red_mask.png"
-        color_mask_path = out_dir / "color_mask.png"
-        valid_depth_mask_path = out_dir / "valid_depth_mask.png"
 
         cv2.imwrite(str(color_path), rgb)
-        cv2.imwrite(str(depth_path), self._depth_visual(depth, depth_scale=depth_scale))
-        masks = self._color_masks(rgb)
-        valid_depth = self._valid_depth_mask(depth, depth_scale)
-        cv2.imwrite(str(blue_mask_path), masks["BLUE"])
-        cv2.imwrite(str(red_mask_path), masks["RED"])
-        cv2.imwrite(str(color_mask_path), masks["ALL"])
-        cv2.imwrite(str(valid_depth_mask_path), valid_depth)
+        verbose_artifacts = {}
+        if self.debug_verbose:
+            depth_path = out_dir / "depth.png"
+            blue_mask_path = out_dir / "blue_mask.png"
+            red_mask_path = out_dir / "red_mask.png"
+            color_mask_path = out_dir / "color_mask.png"
+            valid_depth_mask_path = out_dir / "valid_depth_mask.png"
+            cv2.imwrite(str(depth_path),
+                        self._depth_visual(depth, depth_scale=depth_scale))
+            masks = self._color_masks(rgb)
+            valid_depth = self._valid_depth_mask(depth, depth_scale)
+            cv2.imwrite(str(blue_mask_path), masks["BLUE"])
+            cv2.imwrite(str(red_mask_path), masks["RED"])
+            cv2.imwrite(str(color_mask_path), masks["ALL"])
+            cv2.imwrite(str(valid_depth_mask_path), valid_depth)
+            verbose_artifacts.update({
+                "depth": self._rel_path(depth_path, out_dir),
+                "blue_mask": self._rel_path(blue_mask_path, out_dir),
+                "red_mask": self._rel_path(red_mask_path, out_dir),
+                "color_mask": self._rel_path(color_mask_path, out_dir),
+                "valid_depth_mask": self._rel_path(valid_depth_mask_path, out_dir),
+            })
 
         overlay = rgb.copy()
         boxes_out = []
+        accepted_count = 0
         for box_idx, box in enumerate(self.detect_boxes(rgb, depth, depth_scale)):
             loc = self.find_location(box, intr, depth_scale)
             faces = self.flatten_faces(box, intr, depth_scale)
 
             x, y, w, h = box["bbox"]
             crop_path = out_dir / f"box_{box_idx}_crop.png"
-            mask_path = out_dir / f"box_{box_idx}_mask.png"
-            object_mask_path = out_dir / f"box_{box_idx}_object_mask.png"
-            box_depth_path = out_dir / f"box_{box_idx}_depth.png"
-            symbol_mask_path = out_dir / f"box_{box_idx}_symbol_mask.png"
-            edges_path = out_dir / f"box_{box_idx}_edges.png"
             quad_path = out_dir / f"box_{box_idx}_face_quad.png"
             cv2.imwrite(str(crop_path), box["rgb_crop"])
-            cv2.imwrite(str(mask_path), box["mask"])
-            cv2.imwrite(str(object_mask_path), box["mask"])
-            cv2.imwrite(str(box_depth_path),
-                        self._depth_visual(box["depth_crop"], box["mask"], depth_scale))
 
             face_results = []
             face_labels = []
             for face_idx, face in enumerate(faces):
                 label, info = self.classify_face(face["image"])
                 face_path = out_dir / f"box_{box_idx}_face_{face_idx}.png"
-                face_symbol_path = (
-                    out_dir / f"box_{box_idx}_face_{face_idx}_symbol_mask.png")
                 endpoints_path = (
                     out_dir / f"box_{box_idx}_face_{face_idx}_endpoints.png")
                 cv2.imwrite(str(face_path), face["image"])
-                cv2.imwrite(str(face_symbol_path), info.get(
-                    "symbol_mask", np.zeros(face["image"].shape[:2], np.uint8)))
                 if "endpoints_image" in info:
                     cv2.imwrite(str(endpoints_path), info["endpoints_image"])
                 else:
@@ -949,30 +1259,77 @@ class KFSDetector:
                     "round_end_count": int(info["round_end_count"]),
                     "branch_count": int(info["branch_count"]),
                     "endpoint_count": int(info["endpoint_count"]),
+                    "endpoint_candidates": info.get("endpoint_candidates", []),
+                    "ignored_intersections": info.get("ignored_intersections", []),
                     "quad": face["quad"],
                     "method": face["method"],
                     "clarity_score": float(face["clarity_score"]),
                     "symbol_area": float(face["symbol_area"]),
                     "image_path": self._rel_path(face_path, out_dir),
-                    "symbol_mask_path": self._rel_path(face_symbol_path, out_dir),
                     "endpoints_path": self._rel_path(endpoints_path, out_dir),
                 })
 
             if faces:
-                cv2.imwrite(str(symbol_mask_path), faces[0]["symbol_mask"])
-                cv2.imwrite(str(edges_path), faces[0]["edges"])
                 cv2.imwrite(str(quad_path), faces[0]["quad_debug"])
+                status = "accepted"
+                reject_reason = None
+                accepted_count += 1
             else:
-                cv2.imwrite(str(symbol_mask_path),
-                            self._symbol_mask(box["rgb_crop"], box["mask"]))
-                cv2.imwrite(str(edges_path),
-                            self._face_edges(box["rgb_crop"], box["mask"]))
-                cv2.imwrite(str(quad_path), box["rgb_crop"])
+                symbol_mask = self._symbol_mask(box["rgb_crop"], box["mask"])
+                groups = self._symbol_groups(symbol_mask)
+                if groups:
+                    color_mask = self._same_color_face_mask(
+                        box["rgb_crop"], box["mask"], box.get("color", "ALL"))
+                    edges = self._face_edges(
+                        box["rgb_crop"], color_mask, symbol_mask)
+                    quad_debug = self._quad_debug_image(
+                        box["rgb_crop"], [], symbol_mask, edges, groups)
+                    reject_reason = "no_flattenable_face"
+                else:
+                    quad_debug = box["rgb_crop"]
+                    reject_reason = "no_symbol_group"
+                cv2.imwrite(str(quad_path), quad_debug)
+                status = "rejected"
 
-            draw_color = (255, 0, 0) if box.get("color") == "BLUE" else (0, 0, 255)
+            box_artifacts = {
+                "crop": self._rel_path(crop_path, out_dir),
+                "face_quad": self._rel_path(quad_path, out_dir),
+            }
+            if self.debug_verbose:
+                mask_path = out_dir / f"box_{box_idx}_mask.png"
+                object_mask_path = out_dir / f"box_{box_idx}_object_mask.png"
+                box_depth_path = out_dir / f"box_{box_idx}_depth.png"
+                symbol_mask_path = out_dir / f"box_{box_idx}_symbol_mask.png"
+                edges_path = out_dir / f"box_{box_idx}_edges.png"
+                symbol_mask = self._symbol_mask(box["rgb_crop"], box["mask"])
+                color_mask = self._same_color_face_mask(
+                    box["rgb_crop"], box["mask"], box.get("color", "ALL"))
+                cv2.imwrite(str(mask_path), box["mask"])
+                cv2.imwrite(str(object_mask_path), box["mask"])
+                cv2.imwrite(str(box_depth_path),
+                            self._depth_visual(
+                                box["depth_crop"], box["mask"], depth_scale))
+                cv2.imwrite(str(symbol_mask_path), symbol_mask)
+                cv2.imwrite(str(edges_path),
+                            self._face_edges(
+                                box["rgb_crop"], color_mask, symbol_mask))
+                box_artifacts.update({
+                    "mask": self._rel_path(mask_path, out_dir),
+                    "object_mask": self._rel_path(object_mask_path, out_dir),
+                    "depth": self._rel_path(box_depth_path, out_dir),
+                    "symbol_mask": self._rel_path(symbol_mask_path, out_dir),
+                    "edges": self._rel_path(edges_path, out_dir),
+                })
+
+            if status == "accepted":
+                draw_color = (255, 0, 0) if box.get("color") == "BLUE" else (0, 0, 255)
+            else:
+                draw_color = (128, 128, 128)
             cv2.rectangle(overlay, (x, y), (x + w, y + h), draw_color, 2)
             label_text = f"box {box_idx} {box.get('color', '')}".strip()
-            if face_labels:
+            if status == "rejected":
+                label_text += f" rejected:{reject_reason}"
+            elif face_labels:
                 label_text += " " + "/".join(face_labels)
             if loc:
                 label_text += f" z={loc[2]:.2f}m"
@@ -984,18 +1341,12 @@ class KFSDetector:
                 "box_index": int(box_idx),
                 "bbox": [int(v) for v in box["bbox"]],
                 "color": box.get("color"),
+                "status": status,
+                "reject_reason": reject_reason,
                 "object_depth_m": float(box["object_depth_m"]),
                 "location_xyz_m": [float(v) for v in loc] if loc else None,
                 "faces": face_results,
-                "artifacts": {
-                    "crop": self._rel_path(crop_path, out_dir),
-                    "mask": self._rel_path(mask_path, out_dir),
-                    "object_mask": self._rel_path(object_mask_path, out_dir),
-                    "depth": self._rel_path(box_depth_path, out_dir),
-                    "symbol_mask": self._rel_path(symbol_mask_path, out_dir),
-                    "edges": self._rel_path(edges_path, out_dir),
-                    "face_quad": self._rel_path(quad_path, out_dir),
-                },
+                "artifacts": box_artifacts,
             })
 
         cv2.imwrite(str(overlay_path), overlay)
@@ -1024,18 +1375,15 @@ class KFSDetector:
             "selected_clarity": float(frame_clarity),
             "min_frame_clarity": float(self.min_frame_clarity),
             "skipped_blurry_frames": int(skipped_blurry_frames),
-            "n_boxes": int(len(boxes_out)),
+            "n_candidates": int(len(boxes_out)),
+            "n_boxes": int(accepted_count),
             "artifacts": {
                 "color": self._rel_path(color_path, out_dir),
-                "depth": self._rel_path(depth_path, out_dir),
                 "boxes_overlay": self._rel_path(overlay_path, out_dir),
-                "blue_mask": self._rel_path(blue_mask_path, out_dir),
-                "red_mask": self._rel_path(red_mask_path, out_dir),
-                "color_mask": self._rel_path(color_mask_path, out_dir),
-                "valid_depth_mask": self._rel_path(valid_depth_mask_path, out_dir),
             },
             "boxes": boxes_out,
         }
+        result["artifacts"].update(verbose_artifacts)
         result_path = out_dir / "result.json"
         self.save(result, result_path)
         return result
