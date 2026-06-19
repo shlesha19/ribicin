@@ -129,7 +129,7 @@ class KFSDetector:
         self.n_samples      = cfg.get("n_samples", 100)
         self.white_min      = cfg.get("white_min", 0.70)
         self.white_max      = cfg.get("white_max", 0.80)
-        self.count_thresh   = cfg.get("count_thresh", 5)
+        self.count_thresh   = cfg.get("count_thresh", 3)
         self.kfs_min_area   = cfg.get("kfs_min_area", 4000)
         self.dedup_dist     = cfg.get("dedup_dist", 5)
         self.close_kernel   = cfg.get("close_kernel", 15)
