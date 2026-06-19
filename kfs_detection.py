@@ -159,6 +159,8 @@ class KFSDetector:
         self.symbol_border_margin = cfg.get("symbol_border_margin", 14)
         self.face_pad_frac = cfg.get("face_pad_frac", 0.45)
         self.symbol_group_close = cfg.get("symbol_group_close", 13)
+        self.face_depth_tol = cfg.get("face_depth_tol", 0.05)
+        self.face_depth_frac = cfg.get("face_depth_frac", 0.04)
         self.debug_verbose = cfg.get("debug_verbose", False)
 
         # --- real/fake (endpoint sharpness logic) ---
@@ -270,7 +272,21 @@ class KFSDetector:
 
         if cv2.countNonZero(keep) < self.min_seed_px:
             return None
-        return (x0, y0, x1 - x0, y1 - y0), keep, z
+
+        ys, xs = np.nonzero(keep > 0)
+        if len(xs) == 0:
+            return None
+        tight_pad = max(3, self.box_pad // 2)
+        tx0 = max(0, int(xs.min()) - tight_pad)
+        ty0 = max(0, int(ys.min()) - tight_pad)
+        tx1 = min(keep.shape[1], int(xs.max()) + tight_pad + 1)
+        ty1 = min(keep.shape[0], int(ys.max()) + tight_pad + 1)
+        tight_keep = keep[ty0:ty1, tx0:tx1]
+        return (
+            (x0 + tx0, y0 + ty0, tx1 - tx0, ty1 - ty0),
+            tight_keep,
+            z,
+        )
 
     def detect_boxes(self, rgb, depth, depth_scale=0.001):
         """Find red/blue boxes, then refine each candidate by valid depth.
@@ -313,6 +329,7 @@ class KFSDetector:
                     "mask": mask_crop.copy(),
                     "color": color_name,
                     "object_depth_m": object_depth,
+                    "depth_scale": depth_scale,
                 })
 
         boxes.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
@@ -573,6 +590,86 @@ class KFSDetector:
             color = cv2.bitwise_and(color, obj)
         return color
 
+    def _same_depth_face_mask(self, box, group):
+        """Pixels on the same local depth plane as the selected KFS mark."""
+        object_mask = box.get("mask")
+        depth_crop = box.get("depth_crop")
+        if object_mask is None or depth_crop is None or depth_crop.size == 0:
+            return object_mask
+
+        depth_scale = box.get("depth_scale", 0.001)
+        depth_m = depth_crop.astype(np.float32) * depth_scale
+        valid = (
+            (depth_crop > 0) &
+            (depth_m > self.min_depth) &
+            (depth_m < self.max_depth) &
+            (object_mask > 0)
+        )
+        if not np.any(valid):
+            return object_mask
+
+        x, y, w, h = group["bbox"]
+        pad = max(8, int(max(w, h) * 0.35))
+        H, W = depth_m.shape
+        x0, x1 = max(0, x - pad), min(W, x + w + pad)
+        y0, y1 = max(0, y - pad), min(H, y + h + pad)
+
+        near_symbol = np.zeros_like(object_mask, dtype=bool)
+        near_symbol[y0:y1, x0:x1] = True
+        symbol_depths = depth_m[near_symbol & valid]
+        if symbol_depths.size < self.min_seed_px:
+            group_touch = cv2.dilate(
+                group["mask"],
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)))
+            symbol_depths = depth_m[(group_touch > 0) & valid]
+        if symbol_depths.size == 0:
+            return object_mask
+
+        z = float(np.median(symbol_depths))
+        tol = max(self.face_depth_tol, z * self.face_depth_frac)
+        same_plane = (np.abs(depth_m - z) <= tol) & valid
+        same_plane = same_plane.astype(np.uint8) * 255
+        same_plane = self._clean_binary(same_plane, open_size=3, close_size=11)
+
+        group_touch = cv2.dilate(
+            group["mask"],
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)))
+        keep = np.zeros_like(same_plane)
+        contours, _ = cv2.findContours(same_plane, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            component = np.zeros_like(same_plane)
+            cv2.drawContours(component, [cnt], -1, 255, cv2.FILLED)
+            if np.any((component > 0) & (group_touch > 0)):
+                cv2.drawContours(keep, [cnt], -1, 255, cv2.FILLED)
+
+        if cv2.countNonZero(keep) < self.min_face_px:
+            return object_mask
+        return keep
+
+    @staticmethod
+    def _component_touching_mask(mask, touch_mask, touch_dilate=13):
+        if mask is None or cv2.countNonZero(mask) == 0:
+            return mask
+
+        touch = (touch_mask > 0).astype(np.uint8) * 255
+        if touch_dilate > 1:
+            touch = cv2.dilate(
+                touch,
+                cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (touch_dilate, touch_dilate)))
+
+        keep = np.zeros_like(mask)
+        contours, _ = cv2.findContours(
+            (mask > 0).astype(np.uint8) * 255,
+            cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            component = np.zeros_like(mask)
+            cv2.drawContours(component, [cnt], -1, 255, cv2.FILLED)
+            if np.any((component > 0) & (touch > 0)):
+                cv2.drawContours(keep, [cnt], -1, 255, cv2.FILLED)
+        return keep
+
     @staticmethod
     def _mask_center(symbol_mask):
         ys, xs = np.nonzero(symbol_mask > 0)
@@ -640,26 +737,60 @@ class KFSDetector:
         area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
         return inter / max(1e-6, area_a + area_b - inter)
 
-    def _fallback_symbol_quad(self, group, color_mask):
-        H, W = color_mask.shape
-        x, y, w, h = group["bbox"]
-        pad = int(max(w, h) * self.face_pad_frac)
+    def _face_slab_mask(self, face_mask, group, boundaries):
+        H, W = face_mask.shape
+        cx, _ = group["center"]
+        x, _, w, _ = group["bbox"]
 
-        ys, xs = np.nonzero(color_mask > 0)
-        if len(xs) > 0:
-            bx0, bx1 = int(xs.min()), int(xs.max())
-            by0, by1 = int(ys.min()), int(ys.max())
+        ys, xs = np.nonzero(face_mask > 0)
+        if len(xs) == 0:
+            return face_mask
+
+        bx0, bx1 = int(xs.min()), int(xs.max())
+        lefts = [b for b in boundaries if b < cx - 2]
+        rights = [b for b in boundaries if b > cx + 2]
+        x0 = max(0, bx0)
+        x1 = min(W - 1, bx1)
+        if lefts:
+            x0 = max(x0, int(round(max(lefts))) - 2)
+        if rights:
+            x1 = min(x1, int(round(min(rights))) + 2)
+
+        if x1 - x0 < max(16, w):
+            x0 = max(0, bx0)
+            x1 = min(W - 1, bx1)
+            pad = max(8, int(max(group["bbox"][2:]) * self.face_pad_frac))
+            x0 = max(x0, x - pad)
+            x1 = min(x1, x + w + pad)
+
+        slab = np.zeros_like(face_mask)
+        slab[:, x0:x1 + 1] = face_mask[:, x0:x1 + 1]
+        return slab
+
+    def _rect_quad_from_face_mask(self, face_mask, group):
+        H, W = face_mask.shape
+        ys, xs = np.nonzero(face_mask > 0)
+        if len(xs) == 0:
+            x, y, w, h = group["bbox"]
+            pad = int(max(w, h) * self.face_pad_frac)
+            x0 = max(0, x - pad)
+            y0 = max(0, y - pad)
+            x1 = min(W - 1, x + w + pad)
+            y1 = min(H - 1, y + h + pad)
         else:
-            bx0, by0, bx1, by1 = 0, 0, W - 1, H - 1
+            x0 = max(0, int(xs.min()) - 2)
+            x1 = min(W - 1, int(xs.max()) + 2)
+            y0 = max(0, int(ys.min()) - 2)
+            y1 = min(H - 1, int(ys.max()) + 2)
 
-        x0 = max(bx0, x - pad, 0)
-        y0 = max(by0, y - pad, 0)
-        x1 = min(bx1, x + w + pad, W - 1)
-        y1 = min(by1, y + h + pad, H - 1)
         return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
                         dtype=np.float32)
 
-    def _quad_from_color_region(self, color_mask, group, boundaries):
+    def _quad_from_color_region(self, color_mask, group, boundaries,
+                                rect_mask=None):
+        if rect_mask is None:
+            rect_mask = color_mask
+        fallback_quad = self._rect_quad_from_face_mask(rect_mask, group)
         cx, _ = group["center"]
         H, W = color_mask.shape
         lefts = [b for b in boundaries if b < cx - 2]
@@ -668,10 +799,10 @@ class KFSDetector:
             x0 = max(0, int(round(max(lefts))) - 2)
             x1 = min(W - 1, int(round(min(rights))) + 2)
         else:
-            return self._fallback_symbol_quad(group, color_mask), "symbol_rect_fallback"
+            return fallback_quad, "depth_color_face_rect_fallback"
 
         if x1 - x0 < max(16, group["bbox"][2]):
-            return self._fallback_symbol_quad(group, color_mask), "symbol_rect_fallback"
+            return fallback_quad, "depth_color_face_rect_fallback"
 
         band = np.zeros_like(color_mask)
         band[:, x0:x1 + 1] = color_mask[:, x0:x1 + 1]
@@ -698,22 +829,38 @@ class KFSDetector:
                 best_score = overlap
 
         if best is None:
-            return self._fallback_symbol_quad(group, color_mask), "symbol_rect_fallback"
+            return fallback_quad, "depth_color_face_rect_fallback"
 
         peri = cv2.arcLength(best, True)
         approx = cv2.approxPolyDP(best, 0.035 * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
             quad = approx[:, 0, :].astype(np.float32)
-            return self._order_quad(quad), "color_face_contour"
+            method = "depth_color_face_contour"
+            ordered = self._order_quad(quad)
+            if self._quad_area_ratio(ordered, fallback_quad) < 0.55:
+                return fallback_quad, "depth_color_face_rect_fallback"
+            return ordered, method
 
         hull = cv2.convexHull(best)
         if len(hull) >= 4:
             quad = hull[:, 0, :].astype(np.float32)
-            return self._order_quad(quad), "color_face_hull"
+            ordered = self._order_quad(quad)
+            if self._quad_area_ratio(ordered, fallback_quad) < 0.55:
+                return fallback_quad, "depth_color_face_rect_fallback"
+            return ordered, "depth_color_face_hull"
 
         rect = cv2.minAreaRect(best)
         quad = cv2.boxPoints(rect).astype(np.float32)
-        return self._order_quad(quad), "color_face_rect"
+        ordered = self._order_quad(quad)
+        if self._quad_area_ratio(ordered, fallback_quad) < 0.55:
+            return fallback_quad, "depth_color_face_rect_fallback"
+        return ordered, "depth_color_face_rect"
+
+    @staticmethod
+    def _quad_area_ratio(quad, reference_quad):
+        area = abs(cv2.contourArea(np.asarray(quad, dtype=np.float32)))
+        ref = abs(cv2.contourArea(np.asarray(reference_quad, dtype=np.float32)))
+        return float(area / max(1e-6, ref))
 
     def _face_edges(self, crop, object_mask, symbol_mask=None):
         if object_mask is None:
@@ -808,9 +955,10 @@ class KFSDetector:
     def _face_score(face):
         quality = face.get("quad_quality", {})
         return (
-            float(face.get("warped_symbol_area", 0)),
             float(quality.get("area", 0.0)),
+            float(face.get("symbol_area", 0.0)),
             -float(quality.get("aspect", 999.0)),
+            float(face.get("warped_symbol_area", 0)),
         )
 
     def _selected_face_debug_image(self, crop, face):
@@ -848,9 +996,31 @@ class KFSDetector:
         boundaries = self._vertical_face_boundaries(edges, color_mask, groups)
         candidates = []
         used = []
-        for group in groups:
+        for group in sorted(groups, key=lambda g: g["area"], reverse=True):
+            depth_face_mask = self._same_depth_face_mask(box, group)
+            if depth_face_mask is not None:
+                face_color_mask = cv2.bitwise_and(color_mask, depth_face_mask)
+                if cv2.countNonZero(face_color_mask) < self.min_face_px:
+                    face_color_mask = color_mask
+            else:
+                face_color_mask = color_mask
+                depth_face_mask = object_mask
+
+            connected_face = self._component_touching_mask(
+                face_color_mask, group["mask"])
+            if cv2.countNonZero(connected_face) < self.min_face_px:
+                connected_face = face_color_mask
+
+            selected_face_mask = self._face_slab_mask(
+                connected_face, group, boundaries)
+            selected_face_mask = self._component_touching_mask(
+                selected_face_mask, group["mask"])
+            if cv2.countNonZero(selected_face_mask) < self.min_face_px:
+                selected_face_mask = connected_face
+
             quad, method = self._quad_from_color_region(
-                color_mask, group, boundaries)
+                selected_face_mask, group, boundaries,
+                rect_mask=selected_face_mask)
             quad_quality = self._quad_quality(quad, crop.shape)
             if not quad_quality["valid"]:
                 continue
@@ -878,6 +1048,9 @@ class KFSDetector:
                 "symbol_mask": warped_symbol,
                 "crop_symbol_mask": symbol_mask,
                 "crop_symbol_group": group["mask"],
+                "face_color_mask": face_color_mask,
+                "depth_face_mask": depth_face_mask,
+                "selected_face_mask": selected_face_mask,
                 "edges": edges,
             })
 
@@ -1558,7 +1731,9 @@ class KFSDetector:
                         "confidence": result["confidence"],
                         "prediction_accepted": True,
                         "selected_face_score": face.get("selection_score", []),
-                        "selected_symbol_area": face.get("warped_symbol_area", 0),
+                        "selected_symbol_area": face.get("symbol_area", 0.0),
+                        "selected_warped_symbol_area": face.get(
+                            "warped_symbol_area", 0),
                         "selected_quad_area": (
                             face.get("quad_quality", {}).get("area")),
                     })
@@ -1646,6 +1821,12 @@ class KFSDetector:
                 selected_face_path = out_dir / f"box_{box_idx}_selected_face.png"
                 flatten_path = out_dir / f"box_{box_idx}_flatten.png"
                 endpoints_path = out_dir / f"box_{box_idx}_endpoints.png"
+                face_color_mask_path = (
+                    out_dir / f"box_{box_idx}_face_color_mask.png")
+                depth_face_mask_path = (
+                    out_dir / f"box_{box_idx}_depth_face_mask.png")
+                selected_face_mask_path = (
+                    out_dir / f"box_{box_idx}_selected_face_mask.png")
                 cv2.imwrite(str(selected_face_path),
                             face.get("selected_face_debug", box["rgb_crop"]))
                 cv2.imwrite(str(flatten_path), face["image"])
@@ -1653,21 +1834,49 @@ class KFSDetector:
                     cv2.imwrite(str(endpoints_path), info["endpoints_image"])
                 else:
                     cv2.imwrite(str(endpoints_path), face["image"])
+                if "face_color_mask" in face:
+                    cv2.imwrite(str(face_color_mask_path),
+                                face["face_color_mask"])
+                if "depth_face_mask" in face:
+                    cv2.imwrite(str(depth_face_mask_path),
+                                face["depth_face_mask"])
+                if "selected_face_mask" in face:
+                    cv2.imwrite(str(selected_face_mask_path),
+                                face["selected_face_mask"])
 
                 artifacts.update({
                     "selected_face": self._rel_path(selected_face_path, out_dir),
                     "flatten": self._rel_path(flatten_path, out_dir),
                     "endpoints": self._rel_path(endpoints_path, out_dir),
+                    "face_color_mask": self._rel_path(
+                        face_color_mask_path, out_dir),
+                    "depth_face_mask": self._rel_path(
+                        depth_face_mask_path, out_dir),
+                    "selected_face_mask": self._rel_path(
+                        selected_face_mask_path, out_dir),
                 })
 
                 result = self._face_result_record(face, label, info, face_loc)
                 selected_face_summary = {
                     "label": label,
                     "confidence": float(info.get("confidence", 0.0)),
+                    "quality_reason": info.get("quality_reason"),
+                    "method": face.get("method"),
                     "score": face.get("selection_score", []),
-                    "symbol_area": int(face.get("warped_symbol_area", 0)),
+                    "symbol_area": float(face.get("symbol_area", 0.0)),
+                    "warped_symbol_area": int(face.get("warped_symbol_area", 0)),
                     "quad_area": face.get("quad_quality", {}).get("area"),
                     "quad_aspect": face.get("quad_quality", {}).get("aspect"),
+                    "face_clarity": float(info.get("face_clarity", 0.0)),
+                    "face_color_px": int(cv2.countNonZero(
+                        face.get("face_color_mask", np.zeros(
+                            box["rgb_crop"].shape[:2], np.uint8)))),
+                    "depth_face_px": int(cv2.countNonZero(
+                        face.get("depth_face_mask", np.zeros(
+                            box["rgb_crop"].shape[:2], np.uint8)))),
+                    "selected_face_px": int(cv2.countNonZero(
+                        face.get("selected_face_mask", np.zeros(
+                            box["rgb_crop"].shape[:2], np.uint8)))),
                     "distance_ok": bool(result.get("distance_ok", False)),
                 }
                 selected_face = selected_face_summary
