@@ -15,12 +15,12 @@ just import this:
 
     det.run(src, "boxes.json")
 
-Pipeline (per frame):
-    box_detect   -> crop each box (rgb + depth)
-    flatten      -> rectify each visible face to a head-on view
-    classify_face-> REAL / FAKE / NONE per face   (corner logic from prototypes)
-    localise     -> camera-relative (X, Y, Z) in meters
-    save         -> JSON log / cache
+Pipeline (per frame), each step is one public method:
+    detect_boxes   -> crop each box (rgb + depth)
+    flatten_faces  -> rectify each visible face to a head-on view
+    classify_face  -> REAL / FAKE / NONE per face   (corner logic from prototypes)
+    find_location  -> camera-relative (X, Y, Z) in meters
+    save           -> JSON log / cache
 
 Needs numpy + opencv always; pyrealsense2 only for live/.bag sources (imported
 lazily so the 2D classify path still runs on a dev machine without the SDK).
@@ -45,9 +45,13 @@ class RealSenseSource:
     """
 
     def __init__(self, testing=False, bag_path=None,
-                 width=640, height=480, fps=30):
+                 width=640, height=480, fps=30, sample_fps=None):
         import pyrealsense2 as rs   # lazy: only needed for a real source
-        self.rs = rs
+
+        # how many frames per second to actually emit. For .bag testing we
+        # default to 3 fps; live runs full rate unless a value is given.
+        self.sample_fps = sample_fps if sample_fps is not None else (3.0 if testing else None)
+        self._min_interval_ms = (1000.0 / self.sample_fps) if self.sample_fps else 0.0
 
         self.pipeline = rs.pipeline()
         cfg = rs.config()
@@ -60,17 +64,31 @@ class RealSenseSource:
             cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
 
         profile = self.pipeline.start(cfg)
+        if testing:
+            # process every frame instead of dropping frames in real time
+            profile.get_device().as_playback().set_real_time(False)
         self.align = rs.align(rs.stream.color)
         self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
 
     def frames(self):
-        """Generator of (rgb_bgr, depth_uint16, intrinsics, depth_scale)."""
+        """Generator of (rgb_bgr, depth_uint16, intrinsics, depth_scale).
+
+        If `sample_fps` is set, frames are subsampled by timestamp to roughly
+        that rate (e.g. 3 fps for .bag testing).
+        """
+        last_ts = None
         try:
             while True:
                 try:
                     frames = self.pipeline.wait_for_frames()
                 except RuntimeError:
                     break  # end of .bag
+                # subsample to sample_fps using the frame timestamp (ms)
+                if self._min_interval_ms > 0:
+                    ts = frames.get_timestamp()
+                    if last_ts is not None and (ts - last_ts) < self._min_interval_ms:
+                        continue
+                    last_ts = ts
                 frames = self.align.process(frames)
                 depth_f = frames.get_depth_frame()
                 color_f = frames.get_color_frame()
@@ -102,7 +120,6 @@ class KFSDetector:
         self.plane_tol      = cfg.get("plane_tol", 0.02)   # m, plane membership
         self.min_face_px    = cfg.get("min_face_px", 800)  # min pixels per face
         self.out_size       = cfg.get("out_size", 256)     # rectified face size (px)
-        self.normal_cache_deg = cfg.get("normal_cache_deg", 5.0)  # reuse remap if <this
 
         # --- real/fake (2D corner logic, ported from the prototypes) ---
         self.stroke_thresh  = cfg.get("stroke_thresh", 80)
@@ -120,20 +137,19 @@ class KFSDetector:
         # --- localisation / association ---
         self.assoc_dist     = cfg.get("assoc_dist", 0.30)  # m, same-box matching
 
-        self._flatten_cache = {}   # face-slot -> (normal, map_x, map_y)
-
     # ════════════════════════════════════════════════════════════════════════
-    # 1. BOX DETECTION  (depth-based segmentation)
+    # 1. DETECT BOXES  (depth-based segmentation)
     # ════════════════════════════════════════════════════════════════════════
-    def box_detect(self, rgb, depth, depth_scale=0.001):
+    def detect_boxes(self, rgb, depth, depth_scale=0.001):
         """Find boxes as depth foreground blobs.
 
         Returns a list of box dicts:
-            {bbox:(x,y,w,h), rgb_crop, depth_crop, mask}   (mask is full-frame)
+            {bbox:(x,y,w,h), rgb_crop, depth_crop, mask}
+        `mask` is the box outline, cropped to the bbox (255 = box, 0 = background).
         """
         depth_m = depth.astype(np.float32) * depth_scale
         valid = (depth_m > self.min_depth) & (depth_m < self.max_depth)
-        fg = (valid.astype(np.uint8)) * 255
+        fg = valid.astype(np.uint8) * 255
 
         # clean up speckle, close small gaps
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -146,23 +162,27 @@ class KFSDetector:
             if cv2.contourArea(cnt) < self.box_min_area:
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
-            mask = np.zeros(depth.shape[:2], np.uint8)
-            cv2.drawContours(mask, [cnt], -1, 255, cv2.FILLED)
+            mask_full = np.zeros(depth.shape[:2], np.uint8)
+            cv2.drawContours(mask_full, [cnt], -1, 255, cv2.FILLED)
             boxes.append({
                 "bbox": (x, y, w, h),
                 "rgb_crop": rgb[y:y + h, x:x + w].copy(),
                 "depth_crop": depth[y:y + h, x:x + w].copy(),
-                "mask": mask,
+                "mask": mask_full[y:y + h, x:x + w].copy(),   # box outline only
             })
         return boxes
 
     # ════════════════════════════════════════════════════════════════════════
-    # 2. FLATTEN  (split into faces, rectify each to head-on view)
+    # 2. FLATTEN FACES  (split into faces, rectify each to head-on view)
     # ════════════════════════════════════════════════════════════════════════
-    def _deproject(self, depth_crop, intr, bbox, depth_scale):
-        """Crop depth -> Nx3 cloud (m) + the (u,v) pixel of each valid point."""
+    def _depth_to_points(self, depth_crop, mask, intr, bbox, depth_scale):
+        """Crop depth -> Nx3 cloud (m) + the (u,v) pixel of each valid point.
+
+        Only pixels inside the box `mask` are used, so background that happens to
+        sit inside the bounding box is ignored.
+        """
         x0, y0, _, _ = bbox
-        ys, xs = np.nonzero(depth_crop > 0)
+        ys, xs = np.nonzero((depth_crop > 0) & (mask > 0))
         z = depth_crop[ys, xs].astype(np.float32) * depth_scale
         u = xs + x0
         v = ys + y0
@@ -172,10 +192,10 @@ class KFSDetector:
         uv = np.stack([xs, ys], axis=1)        # local crop coords
         return pts, uv
 
-    def _segment_faces(self, pts, uv):
+    def _split_faces(self, pts, uv):
         """Greedy plane clustering: peel off the largest plane repeatedly.
 
-        Returns a list of (plane_pts, plane_uv) groups, each a visible face.
+        Returns a list of (face_pts, face_uv, normal, centroid), one per face.
         """
         faces = []
         remaining = np.ones(len(pts), bool)
@@ -198,8 +218,8 @@ class KFSDetector:
         return faces
 
     @staticmethod
-    def _rodrigues_to_z(normal):
-        """Rotation aligning `normal` with +Z."""
+    def _face_rotation(normal):
+        """Rotation matrix that turns the face normal to point at the camera (+Z)."""
         n = normal / (np.linalg.norm(normal) + 1e-9)
         if n[2] < 0:                            # face the camera
             n = -n
@@ -213,7 +233,7 @@ class KFSDetector:
         R, _ = cv2.Rodrigues(axis * angle)
         return R
 
-    def _build_remap(self, P, uv, R, centroid):
+    def _build_warp_maps(self, P, uv, R, centroid):
         """Rotate cloud flat, scatter (X',Y') onto a grid -> map_x/map_y."""
         Pr = (P - centroid) @ R.T               # rotate; face now ~ XY plane
         xy = Pr[:, :2]
@@ -249,34 +269,21 @@ class KFSDetector:
             hole = (~filled).astype(np.uint8)
         return map_x, map_y
 
-    def flatten(self, box, intr, depth_scale=0.001, cache_key=None):
+    def flatten_faces(self, box, intr, depth_scale=0.001):
         """Rectify each visible face of `box` to a head-on image.
 
         Returns a list of face dicts:
             {image, normal, centroid, n_points}
         """
-        pts, uv = self._deproject(box["depth_crop"], intr, box["bbox"], depth_scale)
+        pts, uv = self._depth_to_points(
+            box["depth_crop"], box["mask"], intr, box["bbox"], depth_scale)
         if len(pts) < self.min_face_px:
             return []
 
         faces_out = []
-        for i, (P, fuv, normal, centroid) in enumerate(self._segment_faces(pts, uv)):
-            slot = (cache_key, i) if cache_key is not None else None
-            R = self._rodrigues_to_z(normal)
-
-            cached = self._flatten_cache.get(slot) if slot else None
-            if cached is not None:
-                c_norm, map_x, map_y = cached
-                ang = np.degrees(np.arccos(
-                    np.clip(abs(c_norm @ (normal / (np.linalg.norm(normal) + 1e-9))), -1, 1)))
-                if ang > self.normal_cache_deg:
-                    cached = None
-            if cached is None:
-                map_x, map_y = self._build_remap(P, fuv, R, centroid)
-                if slot:
-                    self._flatten_cache[slot] = (
-                        normal / (np.linalg.norm(normal) + 1e-9), map_x, map_y)
-
+        for P, fuv, normal, centroid in self._split_faces(pts, uv):
+            R = self._face_rotation(normal)
+            map_x, map_y = self._build_warp_maps(P, fuv, R, centroid)
             image = cv2.remap(box["rgb_crop"], map_x, map_y, cv2.INTER_LINEAR)
             faces_out.append({
                 "image": image,
@@ -287,9 +294,9 @@ class KFSDetector:
         return faces_out
 
     # ════════════════════════════════════════════════════════════════════════
-    # 3. REAL / FAKE  (2D corner/anchor logic ported from the prototypes)
+    # 3. CLASSIFY FACE  (2D corner/anchor logic ported from the prototypes)
     # ════════════════════════════════════════════════════════════════════════
-    def _binary(self, bgr):
+    def _to_binary(self, bgr):
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         _, b = cv2.threshold(gray, self.stroke_thresh, 255, cv2.THRESH_BINARY)
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
@@ -297,7 +304,7 @@ class KFSDetector:
         closed = cv2.morphologyEx(cv2.bitwise_not(b), cv2.MORPH_CLOSE, k)
         return cv2.bitwise_not(closed)
 
-    def _corners(self, binary):
+    def _find_corners(self, binary):
         contours, _ = cv2.findContours(cv2.bitwise_not(binary),
                                        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         pts = []
@@ -355,7 +362,7 @@ class KFSDetector:
                     return white_pct, True
         return white_pct, False
 
-    def _dedup(self, pts):
+    def _remove_duplicates(self, pts):
         kept = []
         for px, py in pts:
             if all(abs(px - kx) > self.dedup_dist or abs(py - ky) > self.dedup_dist
@@ -370,8 +377,8 @@ class KFSDetector:
         """
         if face_img is None or face_img.size == 0:
             return "NONE", {"valid_count": 0, "n_corners": 0}
-        binary = self._binary(face_img)
-        corners = self._dedup(self._corners(binary))
+        binary = self._to_binary(face_img)
+        corners = self._remove_duplicates(self._find_corners(binary))
         if not corners:
             return "REAL", {"valid_count": 0, "n_corners": 0}  # smooth, no sharp edges
         valid = 0
@@ -383,13 +390,15 @@ class KFSDetector:
         return label, {"valid_count": valid, "n_corners": len(corners)}
 
     # ════════════════════════════════════════════════════════════════════════
-    # 4. LOCALISE  (camera-relative XYZ, meters)
+    # 4. FIND LOCATION  (camera-relative XYZ, meters)
     # ════════════════════════════════════════════════════════════════════════
-    def localise(self, box, depth, intr, depth_scale=0.001):
+    def find_location(self, box, intr, depth_scale=0.001):
         """Deproject the box's depth centroid to camera-relative (X, Y, Z) m."""
-        x, y, w, h = box["bbox"]
+        x, y, _, _ = box["bbox"]
         sub = box["depth_crop"].astype(np.float32) * depth_scale
-        ys, xs = np.nonzero((sub > self.min_depth) & (sub < self.max_depth))
+        ys, xs = np.nonzero((sub > self.min_depth) &
+                            (sub < self.max_depth) &
+                            (box["mask"] > 0))
         if len(xs) == 0:
             return None
         z = float(np.median(sub[ys, xs]))
@@ -411,11 +420,11 @@ class KFSDetector:
     def process_frame(self, rgb, depth, intr, depth_scale=0.001, frame_idx=0):
         """Run the full pipeline on one frame. Returns a list of box records."""
         records = []
-        for bi, box in enumerate(self.box_detect(rgb, depth, depth_scale)):
-            loc = self.localise(box, depth, intr, depth_scale)
-            faces = self.flatten(box, intr, depth_scale, cache_key=(frame_idx, bi))
+        for box in self.detect_boxes(rgb, depth, depth_scale):
+            loc = self.find_location(box, intr, depth_scale)
+            faces = self.flatten_faces(box, intr, depth_scale)
             face_results = []
-            for fi, face in enumerate(faces):
+            for face in faces:
                 label, info = self.classify_face(face["image"])
                 face_results.append({
                     "label": label,
@@ -430,8 +439,8 @@ class KFSDetector:
             })
         return records
 
-    def _associate(self, all_records):
-        """Merge same box across frames by camera-XYZ proximity."""
+    def _merge_boxes(self, all_records):
+        """Merge the same box seen across frames by camera-XYZ proximity."""
         boxes = []   # each: {locations:[...], faces:[...]}
         for rec in all_records:
             loc = rec["location_xyz_m"]
@@ -462,10 +471,10 @@ class KFSDetector:
         return out
 
     def run(self, source, out_path="boxes.json"):
-        """Loop a RealSenseSource, process every frame, save associated boxes."""
+        """Loop a RealSenseSource, process every frame, save merged boxes."""
         all_records = []
         for i, (rgb, depth, intr, depth_scale) in enumerate(source.frames()):
             all_records.extend(self.process_frame(rgb, depth, intr, depth_scale, i))
-        boxes = self._associate(all_records)
+        boxes = self._merge_boxes(all_records)
         self.save({"boxes": boxes, "frames": all_records}, out_path)
         return boxes
