@@ -1,1 +1,5 @@
 __pycache__
+.agents
+.codex
+.vscode
+debug/

@@ -27,6 +27,7 @@ lazily so the 2D classify path still runs on a dev machine without the SDK).
 """
 
 import json
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -70,37 +71,60 @@ class RealSenseSource:
         self.align = rs.align(rs.stream.color)
         self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
 
-    def frames(self):
-        """Generator of (rgb_bgr, depth_uint16, intrinsics, depth_scale).
+    def frame_records(self):
+        """Generator of aligned frame records with source metadata.
 
         If `sample_fps` is set, frames are subsampled by timestamp to roughly
         that rate (e.g. 3 fps for .bag testing).
         """
         last_ts = None
+        start_ts = None
+        source_idx = 0
         try:
             while True:
                 try:
                     frames = self.pipeline.wait_for_frames()
                 except RuntimeError:
                     break  # end of .bag
-                # subsample to sample_fps using the frame timestamp (ms)
-                if self._min_interval_ms > 0:
-                    ts = frames.get_timestamp()
-                    if last_ts is not None and (ts - last_ts) < self._min_interval_ms:
-                        continue
-                    last_ts = ts
+
+                ts = frames.get_timestamp()
+                if start_ts is None:
+                    start_ts = ts
+                timestamp_s = (ts - start_ts) / 1000.0
+
                 frames = self.align.process(frames)
                 depth_f = frames.get_depth_frame()
                 color_f = frames.get_color_frame()
                 if not depth_f or not color_f:
                     continue
+
+                # subsample to sample_fps using the frame timestamp (ms)
+                if self._min_interval_ms > 0:
+                    if last_ts is not None and (ts - last_ts) < self._min_interval_ms:
+                        source_idx += 1
+                        continue
+                    last_ts = ts
+
                 i = color_f.profile.as_video_stream_profile().intrinsics
                 intr = {"fx": i.fx, "fy": i.fy, "ppx": i.ppx, "ppy": i.ppy}
                 rgb = np.asanyarray(color_f.get_data())
                 depth = np.asanyarray(depth_f.get_data())
-                yield rgb, depth, intr, self.depth_scale
+                yield {
+                    "rgb": rgb,
+                    "depth": depth,
+                    "intrinsics": intr,
+                    "depth_scale": self.depth_scale,
+                    "frame_index": source_idx,
+                    "timestamp_s": timestamp_s,
+                }
+                source_idx += 1
         finally:
             self.close()
+
+    def frames(self):
+        """Generator of (rgb_bgr, depth_uint16, intrinsics, depth_scale)."""
+        for rec in self.frame_records():
+            yield rec["rgb"], rec["depth"], rec["intrinsics"], rec["depth_scale"]
 
     def close(self):
         try:
@@ -438,6 +462,119 @@ class KFSDetector:
                 "faces": face_results,
             })
         return records
+
+    def _depth_visual(self, depth, mask=None, depth_scale=0.001):
+        depth_m = depth.astype(np.float32) * depth_scale
+        valid = (depth_m > self.min_depth) & (depth_m < self.max_depth)
+        if mask is not None:
+            valid &= mask > 0
+        if np.any(valid):
+            lo = float(np.percentile(depth_m[valid], 2))
+            hi = float(np.percentile(depth_m[valid], 98))
+            if hi <= lo:
+                hi = lo + 1e-6
+        else:
+            lo, hi = self.min_depth, self.max_depth
+        norm = np.clip((depth_m - lo) / (hi - lo), 0, 1)
+        img = (norm * 255).astype(np.uint8)
+        img[~valid] = 0
+        return cv2.applyColorMap(img, cv2.COLORMAP_JET)
+
+    @staticmethod
+    def _rel_path(path, root):
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            return str(path)
+
+    def debug_process_frame(self, rgb, depth, intr, depth_scale=0.001,
+                            frame_idx=0, timestamp_s=None,
+                            requested_time_s=None, out_dir="debug"):
+        """Process one frame and save visual artifacts for inspection."""
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        color_path = out_dir / "color.png"
+        depth_path = out_dir / "depth.png"
+        overlay_path = out_dir / "boxes_overlay.png"
+
+        cv2.imwrite(str(color_path), rgb)
+        cv2.imwrite(str(depth_path), self._depth_visual(depth, depth_scale=depth_scale))
+
+        overlay = rgb.copy()
+        boxes_out = []
+        for box_idx, box in enumerate(self.detect_boxes(rgb, depth, depth_scale)):
+            loc = self.find_location(box, intr, depth_scale)
+            faces = self.flatten_faces(box, intr, depth_scale)
+
+            x, y, w, h = box["bbox"]
+            crop_path = out_dir / f"box_{box_idx}_crop.png"
+            mask_path = out_dir / f"box_{box_idx}_mask.png"
+            box_depth_path = out_dir / f"box_{box_idx}_depth.png"
+            cv2.imwrite(str(crop_path), box["rgb_crop"])
+            cv2.imwrite(str(mask_path), box["mask"])
+            cv2.imwrite(str(box_depth_path),
+                        self._depth_visual(box["depth_crop"], box["mask"], depth_scale))
+
+            face_results = []
+            face_labels = []
+            for face_idx, face in enumerate(faces):
+                label, info = self.classify_face(face["image"])
+                face_path = out_dir / f"box_{box_idx}_face_{face_idx}.png"
+                cv2.imwrite(str(face_path), face["image"])
+                face_labels.append(label)
+                face_results.append({
+                    "label": label,
+                    "valid_count": int(info["valid_count"]),
+                    "n_corners": int(info["n_corners"]),
+                    "normal": [float(c) for c in face["normal"]],
+                    "n_points": int(face["n_points"]),
+                    "image_path": self._rel_path(face_path, out_dir),
+                })
+
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            label_text = f"box {box_idx}"
+            if face_labels:
+                label_text += " " + "/".join(face_labels)
+            if loc:
+                label_text += f" z={loc[2]:.2f}m"
+            cv2.putText(overlay, label_text, (x, max(20, y - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
+                        cv2.LINE_AA)
+
+            boxes_out.append({
+                "box_index": int(box_idx),
+                "bbox": [int(v) for v in box["bbox"]],
+                "location_xyz_m": [float(v) for v in loc] if loc else None,
+                "faces": face_results,
+                "artifacts": {
+                    "crop": self._rel_path(crop_path, out_dir),
+                    "mask": self._rel_path(mask_path, out_dir),
+                    "depth": self._rel_path(box_depth_path, out_dir),
+                },
+            })
+
+        cv2.imwrite(str(overlay_path), overlay)
+
+        result = {
+            "frame_index": int(frame_idx),
+            "requested_timestamp_s": (
+                float(requested_time_s) if requested_time_s is not None else None
+            ),
+            "selected_timestamp_s": (
+                float(timestamp_s) if timestamp_s is not None else None
+            ),
+            "n_boxes": int(len(boxes_out)),
+            "artifacts": {
+                "color": self._rel_path(color_path, out_dir),
+                "depth": self._rel_path(depth_path, out_dir),
+                "boxes_overlay": self._rel_path(overlay_path, out_dir),
+            },
+            "boxes": boxes_out,
+        }
+        result_path = out_dir / "result.json"
+        self.save(result, result_path)
+        return result
 
     def _merge_boxes(self, all_records):
         """Merge the same box seen across frames by camera-XYZ proximity."""
