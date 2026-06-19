@@ -33,18 +33,50 @@ def _make_debug_dir(seconds):
     return path
 
 
-def _closest_bag_frame(bag_path, target_s):
+def _copy_frame_record(rec, det):
+    out = dict(rec)
+    out["rgb"] = rec["rgb"].copy()
+    out["depth"] = rec["depth"].copy()
+    out["clarity"] = det.clarity_score(out["rgb"])
+    return out
+
+
+def _debug_bag_frame(bag_path, target_s, det):
     source = RealSenseSource(testing=True, bag_path=bag_path, sample_fps=0.0)
-    best = None
-    best_delta = None
+    initial = None
+    selected = None
+    skipped = 0
+    last = None
+
     for rec in source.frame_records():
-        delta = abs(rec["timestamp_s"] - target_s)
-        if best_delta is None or delta < best_delta:
-            best_delta = delta
-            best = dict(rec)
-            best["rgb"] = rec["rgb"].copy()
-            best["depth"] = rec["depth"].copy()
-    return best
+        last = rec
+        if initial is None and rec["timestamp_s"] < target_s:
+            continue
+        if initial is None:
+            initial = _copy_frame_record(rec, det)
+
+        candidate = _copy_frame_record(rec, det)
+        if candidate["clarity"] >= det.min_frame_clarity:
+            selected = candidate
+            break
+        if skipped >= det.debug_max_lookahead_frames:
+            selected = candidate
+            break
+        skipped += 1
+
+    if selected is None and last is not None:
+        selected = _copy_frame_record(last, det)
+        if initial is None:
+            initial = selected
+
+    if selected is None:
+        return None
+
+    selected["initial_frame_index"] = initial["frame_index"]
+    selected["initial_timestamp_s"] = initial["timestamp_s"]
+    selected["initial_clarity"] = initial["clarity"]
+    selected["skipped_blurry_frames"] = skipped
+    return selected
 
 
 def main():
@@ -57,19 +89,20 @@ def main():
                         "(default 3 for --bag, full rate for --live)")
     p.add_argument("--out", default="boxes.json", help="output JSON path")
     p.add_argument("--debug-time", type=float, default=None,
-                   help="process only the bag frame closest to this timestamp "
-                        "in seconds and save debug artifacts under debug/")
+                   help="process one bag frame at this timestamp in seconds; "
+                        "if it is blurry, use the next clear frame and save "
+                        "debug artifacts under debug/")
     args = p.parse_args()
 
     if args.debug_time is not None:
         if not args.bag:
             p.error("--debug-time requires --bag")
 
-        rec = _closest_bag_frame(args.bag, args.debug_time)
+        det = KFSDetector()
+        rec = _debug_bag_frame(args.bag, args.debug_time, det)
         if rec is None:
             p.error(f"no aligned color/depth frames found in {args.bag}")
 
-        det = KFSDetector()
         out_dir = _make_debug_dir(args.debug_time)
         result = det.debug_process_frame(
             rec["rgb"],
@@ -80,10 +113,16 @@ def main():
             timestamp_s=rec["timestamp_s"],
             requested_time_s=args.debug_time,
             out_dir=out_dir,
+            initial_frame_idx=rec["initial_frame_index"],
+            initial_timestamp_s=rec["initial_timestamp_s"],
+            initial_clarity=rec["initial_clarity"],
+            skipped_blurry_frames=rec["skipped_blurry_frames"],
         )
         print(f"\nDebug frame saved to {out_dir}")
         print(f"Requested {args.debug_time:.3f}s, selected "
               f"{rec['timestamp_s']:.3f}s at frame {rec['frame_index']}")
+        print(f"Clarity {rec['clarity']:.1f} "
+              f"(skipped {rec['skipped_blurry_frames']} blurry frame(s))")
         print(f"Found {result['n_boxes']} box(es). Result: {out_dir / 'result.json'}")
         return
 
