@@ -177,6 +177,19 @@ class KFSDetector:
         self.endpoint_branch_ignore_radius = cfg.get("endpoint_branch_ignore_radius", 16)
         self.endpoint_tip_radius = cfg.get("endpoint_tip_radius", 10)
         self.endpoint_merge_radius = cfg.get("endpoint_merge_radius", 8)
+        self.black_stroke_max = cfg.get("black_stroke_max", 95)
+        self.black_sat_max = cfg.get("black_sat_max", 190)
+        self.min_black_symbol_area = cfg.get("min_black_symbol_area", 80)
+        self.min_classify_face_clarity = cfg.get("min_classify_face_clarity", 25)
+        self.min_fake_endpoint_count = cfg.get("min_fake_endpoint_count", 2)
+        self.max_fake_branch_count = cfg.get("max_fake_branch_count", 12)
+        self.min_quad_area = cfg.get("min_quad_area", 450.0)
+        self.min_quad_edge = cfg.get("min_quad_edge", 8.0)
+        self.max_quad_aspect = cfg.get("max_quad_aspect", 6.0)
+        self.min_warped_symbol_area = cfg.get(
+            "min_warped_symbol_area", self.min_symbol_area)
+        self.face_distance_abs_tol = cfg.get("face_distance_abs_tol", 0.08)
+        self.face_distance_frac_tol = cfg.get("face_distance_frac_tol", 0.08)
 
         # --- localisation / association ---
         self.assoc_dist     = cfg.get("assoc_dist", 0.30)  # m, same-box matching
@@ -467,6 +480,44 @@ class KFSDetector:
             cv2.drawContours(cleaned, [cnt], -1, 255, cv2.FILLED)
         return cleaned
 
+    def _black_symbol_mask(self, bgr, symbol_hint=None):
+        """Return only the dark KFS stroke, excluding white outline/background."""
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+        if symbol_hint is None:
+            hint = self._symbol_mask(bgr)
+        else:
+            hint = (symbol_hint > 0).astype(np.uint8) * 255
+
+        if cv2.countNonZero(hint) == 0:
+            return hint
+
+        hint_bool = hint > 0
+        hint_vals = gray[hint_bool]
+        adaptive_cut = float(np.percentile(hint_vals, 35)) + 12.0
+        dark_cut = int(max(45, min(self.black_stroke_max, adaptive_cut)))
+
+        # The broad symbol hint finds the mark; these tests remove the white
+        # outline and saturated face/background pixels from that region.
+        greenish = (hue >= 35) & (hue <= 90) & (sat > 45) & (val > 45)
+        neutral_dark = (sat < self.black_sat_max) | (val < 70)
+        dark = ((gray <= dark_cut) | (val <= dark_cut))
+        mask = (hint_bool & dark & neutral_dark & (~greenish)).astype(np.uint8) * 255
+
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+
+        cleaned = np.zeros_like(mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            if cv2.contourArea(cnt) >= 8:
+                cv2.drawContours(cleaned, [cnt], -1, 255, cv2.FILLED)
+        return cleaned
+
     def _symbol_groups(self, symbol_mask):
         """Group fragmented strokes into one mask per visible marking."""
         if cv2.countNonZero(symbol_mask) < self.min_symbol_area:
@@ -707,18 +758,75 @@ class KFSDetector:
         center, area = self._mask_center(symbol_mask)
         return center, float(area)
 
-    def _warp_quad(self, crop, quad):
+    def _warp_quad(self, crop, quad, flags=cv2.INTER_LINEAR, border_value=0):
         S = self.out_size
         dst = np.array([[0, 0], [S - 1, 0], [S - 1, S - 1], [0, S - 1]],
                        dtype=np.float32)
         M = cv2.getPerspectiveTransform(self._order_quad(quad), dst)
-        return cv2.warpPerspective(crop, M, (S, S))
+        return cv2.warpPerspective(
+            crop, M, (S, S), flags=flags, borderValue=border_value)
+
+    def _quad_quality(self, quad, crop_shape):
+        q = self._order_quad(quad)
+        H, W = crop_shape[:2]
+        edges = [
+            float(np.linalg.norm(q[(i + 1) % 4] - q[i]))
+            for i in range(4)
+        ]
+        min_edge = min(edges) if edges else 0.0
+        width = (edges[0] + edges[2]) / 2.0
+        height = (edges[1] + edges[3]) / 2.0
+        aspect = max(width, height) / max(1e-6, min(width, height))
+        area = float(abs(cv2.contourArea(q)))
+        unique = len(np.unique(np.round(q, 1), axis=0))
+        in_bounds = bool(
+            np.all(q[:, 0] >= -1) and np.all(q[:, 0] <= W) and
+            np.all(q[:, 1] >= -1) and np.all(q[:, 1] <= H))
+
+        reason = "ok"
+        if unique < 4:
+            reason = "duplicate_quad_points"
+        elif area < self.min_quad_area:
+            reason = "quad_area_too_small"
+        elif min_edge < self.min_quad_edge:
+            reason = "quad_edge_too_short"
+        elif aspect > self.max_quad_aspect:
+            reason = "quad_aspect_too_extreme"
+        elif not in_bounds:
+            reason = "quad_out_of_crop_bounds"
+
+        return {
+            "valid": reason == "ok",
+            "reason": reason,
+            "area": area,
+            "min_edge": float(min_edge),
+            "aspect": float(aspect),
+            "in_bounds": in_bounds,
+        }
+
+    @staticmethod
+    def _face_score(face):
+        quality = face.get("quad_quality", {})
+        return (
+            float(face.get("warped_symbol_area", 0)),
+            float(quality.get("area", 0.0)),
+            -float(quality.get("aspect", 999.0)),
+        )
+
+    def _selected_face_debug_image(self, crop, face):
+        img = crop.copy()
+        q = np.round(np.asarray(face["quad"], dtype=np.float32)).astype(int)
+        cv2.polylines(img, [q], True, (0, 255, 255), 2)
+        cx = int(np.mean(q[:, 0]))
+        cy = int(np.mean(q[:, 1]))
+        cv2.drawMarker(img, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS, 12, 2)
+        return img
 
     def flatten_faces(self, box, intr, depth_scale=0.001):
-        """Rectify each visible marked face with a 2D perspective warp.
+        """Rectify the single most visible marked face with a 2D warp.
 
         Returns a list of face dicts:
-            {image, quad, method, clarity_score, symbol_area}
+            either [] or [{image, quad, method, clarity_score, symbol_area}]
         """
         crop = box["rgb_crop"]
         object_mask = box["mask"]
@@ -738,34 +846,48 @@ class KFSDetector:
 
         edges = self._face_edges(crop, color_mask, symbol_mask)
         boundaries = self._vertical_face_boundaries(edges, color_mask, groups)
-        faces = []
+        candidates = []
         used = []
         for group in groups:
             quad, method = self._quad_from_color_region(
                 color_mask, group, boundaries)
+            quad_quality = self._quad_quality(quad, crop.shape)
+            if not quad_quality["valid"]:
+                continue
             bbox = self._quad_bbox(quad)
             if any(self._bbox_iou(bbox, prev) > 0.82 for prev in used):
                 continue
             image = self._warp_quad(crop, quad)
             if image is None or image.size == 0:
                 continue
+            warped_symbol = self._warp_quad(
+                group["mask"], quad, flags=cv2.INTER_NEAREST, border_value=0)
+            warped_symbol = (warped_symbol > 0).astype(np.uint8) * 255
+            warped_symbol_area = int(cv2.countNonZero(warped_symbol))
+            if warped_symbol_area < self.min_warped_symbol_area:
+                continue
             used.append(bbox)
-            faces.append({
+            candidates.append({
                 "image": image,
                 "quad": [[float(x), float(y)] for x, y in quad],
                 "method": method,
                 "clarity_score": clarity,
                 "symbol_area": float(group["area"]),
-                "symbol_mask": symbol_mask,
-                "symbol_group": group["mask"],
+                "warped_symbol_area": int(warped_symbol_area),
+                "quad_quality": quad_quality,
+                "symbol_mask": warped_symbol,
+                "crop_symbol_mask": symbol_mask,
+                "crop_symbol_group": group["mask"],
                 "edges": edges,
             })
 
-        if faces:
-            debug = self._quad_debug_image(crop, faces, symbol_mask, edges, groups)
-            for face in faces:
-                face["quad_debug"] = debug
-        return faces
+        if not candidates:
+            return []
+
+        best = max(candidates, key=self._face_score)
+        best["selection_score"] = [float(v) for v in self._face_score(best)]
+        best["selected_face_debug"] = self._selected_face_debug_image(crop, best)
+        return [best]
 
     # ════════════════════════════════════════════════════════════════════════
     # 3. CLASSIFY FACE  (2D corner/anchor logic ported from the prototypes)
@@ -1028,60 +1150,121 @@ class KFSDetector:
             cv2.circle(dbg, (int(x), int(y)), 7, (0, 255, 255), 2)
         return dbg
 
-    def classify_face(self, face_img):
+    def classify_face(self, face_img, symbol_hint=None):
         """Classify one flattened face by sharpness of true symbol endpoints.
 
         label in {REAL, FAKE, NONE}. info has valid_count, n_corners.
         """
+        empty_info = {
+            "valid_count": 0,
+            "n_corners": 0,
+            "sharp_end_count": 0,
+            "round_end_count": 0,
+            "branch_count": 0,
+            "endpoint_count": 0,
+            "endpoint_candidates": [],
+            "ignored_intersections": [],
+            "face_clarity": 0.0,
+            "black_symbol_area": 0,
+            "confidence": 0.0,
+            "quality_reason": "empty_face",
+            "symbol_source": "none",
+            "hint_fallback_reason": None,
+        }
         if face_img is None or face_img.size == 0:
-            return "NONE", {
-                "valid_count": 0,
-                "n_corners": 0,
-                "sharp_end_count": 0,
-                "round_end_count": 0,
-                "branch_count": 0,
-                "endpoint_count": 0,
-                "endpoint_candidates": [],
-                "ignored_intersections": [],
-            }
+            return "NONE", empty_info
 
-        symbol_mask = self._symbol_mask(face_img)
+        face_clarity = self.clarity_score(face_img)
+        hint_mask = None
+        fallback_reason = None
+        if symbol_hint is not None:
+            hint_mask = (symbol_hint > 0).astype(np.uint8) * 255
+
+        if hint_mask is not None and cv2.countNonZero(hint_mask) >= self.min_symbol_area:
+            symbol_mask = hint_mask
+            symbol_source = "warped_hint"
+        else:
+            symbol_mask = self._symbol_mask(face_img)
+            symbol_source = "auto" if hint_mask is None else "auto_fallback"
+            if hint_mask is not None:
+                fallback_reason = "hint_symbol_too_small_auto_fallback"
+
+        empty_info["face_clarity"] = float(face_clarity)
+        empty_info["symbol_mask"] = symbol_mask
+        empty_info["hint_symbol_mask"] = hint_mask
+        empty_info["symbol_source"] = symbol_source
+        empty_info["hint_fallback_reason"] = fallback_reason
+
         if cv2.countNonZero(symbol_mask) < self.min_symbol_area:
-            return "NONE", {
-                "valid_count": 0,
-                "n_corners": 0,
-                "sharp_end_count": 0,
-                "round_end_count": 0,
-                "branch_count": 0,
-                "endpoint_count": 0,
-                "endpoint_candidates": [],
-                "ignored_intersections": [],
-                "symbol_mask": symbol_mask,
-            }
+            empty_info["quality_reason"] = "symbol_mask_too_small"
+            return "NONE", empty_info
 
-        skeleton = self._skeletonize(symbol_mask)
+        black_symbol_mask = self._black_symbol_mask(face_img, symbol_mask)
+        black_area = int(cv2.countNonZero(black_symbol_mask))
+        if (black_area < self.min_black_symbol_area and
+                symbol_source == "warped_hint"):
+            auto_symbol_mask = self._symbol_mask(face_img)
+            auto_black_mask = self._black_symbol_mask(face_img, auto_symbol_mask)
+            auto_black_area = int(cv2.countNonZero(auto_black_mask))
+            if (cv2.countNonZero(auto_symbol_mask) >= self.min_symbol_area and
+                    auto_black_area >= self.min_black_symbol_area):
+                symbol_mask = auto_symbol_mask
+                black_symbol_mask = auto_black_mask
+                black_area = auto_black_area
+                symbol_source = "auto_fallback"
+                fallback_reason = "hint_black_too_small_auto_fallback"
+
+        empty_info["black_symbol_area"] = black_area
+        empty_info["black_symbol_mask"] = black_symbol_mask
+        empty_info["symbol_mask"] = symbol_mask
+        empty_info["symbol_source"] = symbol_source
+        empty_info["hint_fallback_reason"] = fallback_reason
+        if black_area < self.min_black_symbol_area:
+            empty_info["quality_reason"] = (
+                "hint_black_too_small_auto_fallback_failed"
+                if fallback_reason else "black_symbol_too_small")
+            empty_info["endpoints_image"] = face_img.copy()
+            return "NONE", empty_info
+
+        skeleton = self._skeletonize(black_symbol_mask)
         endpoints, ignored_intersections = self._endpoint_candidates(
-            symbol_mask, skeleton)
+            black_symbol_mask, skeleton)
 
         sharp_points = []
         round_points = []
         for pt in endpoints:
-            angle = self._endpoint_angle(symbol_mask, pt)
+            angle = self._endpoint_angle(black_symbol_mask, pt)
             if angle is not None and angle <= self.sharp_end_angle_thresh:
                 sharp_points.append(pt)
             else:
                 round_points.append(pt)
 
-        if not endpoints:
+        quality_reason = "ok"
+        confidence = 0.0
+        if face_clarity < self.min_classify_face_clarity:
             label = "NONE"
+            quality_reason = "face_too_blurry"
+        elif not endpoints:
+            label = "NONE"
+            quality_reason = "no_endpoints"
         elif sharp_points:
             label = "REAL"
-        else:
+            confidence = min(1.0, 0.85 + 0.03 * len(sharp_points))
+        elif len(ignored_intersections) > self.max_fake_branch_count:
+            label = "NONE"
+            quality_reason = "too_many_branches"
+        elif len(round_points) >= self.min_fake_endpoint_count:
             label = "FAKE"
+            confidence = 0.70
+        else:
+            label = "NONE"
+            quality_reason = "too_few_round_endpoints"
+        if quality_reason == "ok" and fallback_reason:
+            quality_reason = fallback_reason
 
         endpoint_debug = self._endpoint_debug_image(
-            face_img, symbol_mask, skeleton, endpoints, ignored_intersections,
-            sharp_points, round_points)
+            face_img, black_symbol_mask, skeleton, endpoints,
+            ignored_intersections, sharp_points, round_points)
         return label, {
             "valid_count": len(sharp_points),
             "n_corners": len(endpoints),
@@ -1094,28 +1277,251 @@ class KFSDetector:
                 [int(x), int(y)] for x, y in ignored_intersections
             ],
             "symbol_mask": symbol_mask,
+            "hint_symbol_mask": hint_mask,
+            "black_symbol_mask": black_symbol_mask,
             "skeleton": skeleton,
             "endpoints_image": endpoint_debug,
+            "face_clarity": float(face_clarity),
+            "black_symbol_area": int(black_area),
+            "confidence": float(confidence),
+            "quality_reason": quality_reason,
+            "symbol_source": symbol_source,
+            "hint_fallback_reason": fallback_reason,
         }
 
     # ════════════════════════════════════════════════════════════════════════
     # 4. FIND LOCATION  (camera-relative XYZ, meters)
     # ════════════════════════════════════════════════════════════════════════
-    def find_location(self, box, intr, depth_scale=0.001):
-        """Deproject the box's depth centroid to camera-relative (X, Y, Z) m."""
-        x, y, _, _ = box["bbox"]
-        sub = box["depth_crop"].astype(np.float32) * depth_scale
-        ys, xs = np.nonzero((sub > self.min_depth) &
-                            (sub < self.max_depth) &
-                            (box["mask"] > 0))
-        if len(xs) == 0:
-            return None
-        z = float(np.median(sub[ys, xs]))
-        u = float(np.mean(xs)) + x
-        v = float(np.mean(ys)) + y
+    def _deproject_pixel(self, u, v, z, intr):
         X = (u - intr["ppx"]) * z / intr["fx"]
         Y = (v - intr["ppy"]) * z / intr["fy"]
-        return (X, Y, z)
+        return (float(X), float(Y), float(z))
+
+    @staticmethod
+    def _distance_xyz(point):
+        if point is None:
+            return None
+        return float(np.linalg.norm(np.asarray(point, dtype=np.float32)))
+
+    def _bbox_centroid_depth(self, box, depth_scale=0.001, radius=3):
+        """Depth at bbox center; falls back to a small valid-depth window."""
+        _, _, w, h = box["bbox"]
+        depth_m = box["depth_crop"].astype(np.float32) * depth_scale
+        cx = (w - 1) / 2.0
+        cy = (h - 1) / 2.0
+        ix = int(round(cx))
+        iy = int(round(cy))
+
+        exact = float(depth_m[iy, ix])
+        if self.min_depth < exact < self.max_depth:
+            return exact, "center_pixel"
+
+        y0, y1 = max(0, iy - radius), min(depth_m.shape[0], iy + radius + 1)
+        x0, x1 = max(0, ix - radius), min(depth_m.shape[1], ix + radius + 1)
+        window = depth_m[y0:y1, x0:x1]
+        valid = window[(window > self.min_depth) & (window < self.max_depth)]
+        if valid.size > 0:
+            return float(np.median(valid)), f"{2 * radius + 1}x{2 * radius + 1}_window"
+
+        object_depths = depth_m[
+            (depth_m > self.min_depth) &
+            (depth_m < self.max_depth) &
+            (box["mask"] > 0)]
+        if object_depths.size > 0:
+            return float(np.median(object_depths)), "object_mask_median_fallback"
+        return None, "no_valid_depth"
+
+    def _local_depth_at(self, depth_m, u, v, valid_mask=None, radius=3):
+        H, W = depth_m.shape[:2]
+        ix = int(round(u))
+        iy = int(round(v))
+        if 0 <= ix < W and 0 <= iy < H:
+            exact = float(depth_m[iy, ix])
+            exact_valid = self.min_depth < exact < self.max_depth
+            if valid_mask is not None:
+                exact_valid = exact_valid and bool(valid_mask[iy, ix])
+            if exact_valid:
+                return exact, "center_pixel"
+
+        x0, x1 = max(0, ix - radius), min(W, ix + radius + 1)
+        y0, y1 = max(0, iy - radius), min(H, iy + radius + 1)
+        if x0 < x1 and y0 < y1:
+            window = depth_m[y0:y1, x0:x1]
+            valid = (window > self.min_depth) & (window < self.max_depth)
+            if valid_mask is not None:
+                valid &= valid_mask[y0:y1, x0:x1]
+            values = window[valid]
+            if values.size > 0:
+                return float(np.median(values)), (
+                    f"{2 * radius + 1}x{2 * radius + 1}_window")
+        return None, "no_valid_depth"
+
+    def _quad_local_mask(self, shape, quad):
+        mask = np.zeros(shape[:2], np.uint8)
+        q = np.round(self._order_quad(quad)).astype(np.int32)
+        cv2.fillConvexPoly(mask, q, 255)
+        return mask
+
+    def face_localization_info(self, box, face, intr, depth_scale=0.001,
+                               loc_info=None):
+        """Distance from crop center to the detected face center."""
+        if loc_info is None:
+            loc_info = self.localization_info(box, intr, depth_scale)
+
+        x, y, _, _ = box["bbox"]
+        quad = np.asarray(face["quad"], dtype=np.float32)
+        face_local = quad.mean(axis=0)
+        face_u = float(x + face_local[0])
+        face_v = float(y + face_local[1])
+
+        depth_m = box["depth_crop"].astype(np.float32) * depth_scale
+        quad_mask = self._quad_local_mask(depth_m.shape, quad) > 0
+        valid_face = quad_mask & (box["mask"] > 0)
+        face_depth, face_depth_source = self._local_depth_at(
+            depth_m, float(face_local[0]), float(face_local[1]), valid_face)
+        if face_depth is None:
+            values = depth_m[
+                valid_face &
+                (depth_m > self.min_depth) &
+                (depth_m < self.max_depth)]
+            if values.size > 0:
+                face_depth = float(np.median(values))
+                face_depth_source = "face_quad_median_fallback"
+
+        face_xyz = None
+        if face_depth is not None:
+            face_xyz = self._deproject_pixel(face_u, face_v, face_depth, intr)
+
+        crop_distance = loc_info["bbox_centroid_distance_m"]
+        face_distance = self._distance_xyz(face_xyz)
+        distance_delta = None
+        if crop_distance is not None and face_distance is not None:
+            distance_delta = abs(float(face_distance) - float(crop_distance))
+        tolerance = max(
+            self.face_distance_abs_tol,
+            self.face_distance_frac_tol * float(crop_distance or 0.0))
+        distance_ok = (
+            distance_delta is not None and distance_delta <= tolerance)
+
+        return {
+            "crop_center_pixel": loc_info["bbox_centroid_pixel"],
+            "crop_center_depth_m": loc_info["bbox_centroid_depth_m"],
+            "crop_center_depth_source": loc_info["bbox_centroid_depth_source"],
+            "crop_center_xyz_m": loc_info["bbox_centroid_xyz_m"],
+            "crop_center_distance_m": crop_distance,
+            "face_center_pixel": [float(face_u), float(face_v)],
+            "face_center_depth_m": (
+                float(face_depth) if face_depth is not None else None),
+            "face_center_depth_source": face_depth_source,
+            "face_center_xyz_m": (
+                [float(v) for v in face_xyz] if face_xyz else None),
+            "face_center_distance_m": face_distance,
+            "distance_delta_m": (
+                float(distance_delta) if distance_delta is not None else None),
+            "distance_tolerance_m": float(tolerance),
+            "distance_ok": bool(distance_ok),
+        }
+
+    def localization_info(self, box, intr, depth_scale=0.001):
+        """Object-mask location plus bbox-centroid depth/distance diagnostics."""
+        x, y, w, h = box["bbox"]
+        sub = box["depth_crop"].astype(np.float32) * depth_scale
+        valid_obj = ((sub > self.min_depth) &
+                     (sub < self.max_depth) &
+                     (box["mask"] > 0))
+        ys, xs = np.nonzero(valid_obj)
+
+        object_xyz = None
+        object_pixel = None
+        object_depth = None
+        if len(xs) > 0:
+            object_depth = float(np.median(sub[ys, xs]))
+            object_u = float(np.mean(xs)) + x
+            object_v = float(np.mean(ys)) + y
+            object_pixel = (object_u, object_v)
+            object_xyz = self._deproject_pixel(object_u, object_v,
+                                               object_depth, intr)
+
+        bbox_u = float(x + (w - 1) / 2.0)
+        bbox_v = float(y + (h - 1) / 2.0)
+        bbox_depth, bbox_depth_source = self._bbox_centroid_depth(
+            box, depth_scale)
+        bbox_xyz = None
+        if bbox_depth is not None:
+            bbox_xyz = self._deproject_pixel(bbox_u, bbox_v, bbox_depth, intr)
+
+        return {
+            "object_centroid_pixel": (
+                [float(object_pixel[0]), float(object_pixel[1])]
+                if object_pixel else None),
+            "object_depth_m": object_depth,
+            "object_xyz_m": (
+                [float(v) for v in object_xyz] if object_xyz else None),
+            "object_distance_m": self._distance_xyz(object_xyz),
+            "bbox_centroid_pixel": [float(bbox_u), float(bbox_v)],
+            "bbox_centroid_depth_m": (
+                float(bbox_depth) if bbox_depth is not None else None),
+            "bbox_centroid_depth_source": bbox_depth_source,
+            "bbox_centroid_xyz_m": (
+                [float(v) for v in bbox_xyz] if bbox_xyz else None),
+            "bbox_centroid_distance_m": self._distance_xyz(bbox_xyz),
+            "crop_center_pixel": [float(bbox_u), float(bbox_v)],
+            "crop_center_depth_m": (
+                float(bbox_depth) if bbox_depth is not None else None),
+            "crop_center_depth_source": bbox_depth_source,
+            "crop_center_xyz_m": (
+                [float(v) for v in bbox_xyz] if bbox_xyz else None),
+            "crop_center_distance_m": self._distance_xyz(bbox_xyz),
+            "valid_object_depth_px": int(len(xs)),
+        }
+
+    def find_location(self, box, intr, depth_scale=0.001):
+        """Deproject the box's depth centroid to camera-relative (X, Y, Z) m."""
+        loc = self.localization_info(box, intr, depth_scale)["object_xyz_m"]
+        return tuple(loc) if loc else None
+
+    @staticmethod
+    def _is_predictive_label(label):
+        return label in ("REAL", "FAKE")
+
+    def _face_result_record(self, face, label, info, face_loc, artifacts=None):
+        record = {
+            "label": label,
+            "prediction_accepted": bool(
+                self._is_predictive_label(label) and
+                face_loc.get("distance_ok", False)),
+            "valid_count": int(info["valid_count"]),
+            "n_corners": int(info["n_corners"]),
+            "sharp_end_count": int(info["sharp_end_count"]),
+            "round_end_count": int(info["round_end_count"]),
+            "branch_count": int(info["branch_count"]),
+            "endpoint_count": int(info["endpoint_count"]),
+            "endpoint_candidates": info.get("endpoint_candidates", []),
+            "ignored_intersections": info.get("ignored_intersections", []),
+            "face_clarity": float(info.get("face_clarity", 0.0)),
+            "black_symbol_area": int(info.get("black_symbol_area", 0)),
+            "confidence": float(info.get("confidence", 0.0)),
+            "quality_reason": info.get("quality_reason", "unknown"),
+            "symbol_source": info.get("symbol_source", "unknown"),
+            "hint_fallback_reason": info.get("hint_fallback_reason"),
+            "quad": face["quad"],
+            "quad_quality": face.get("quad_quality", {}),
+            "method": face["method"],
+            "clarity_score": float(face["clarity_score"]),
+            "symbol_area": float(face["symbol_area"]),
+            "warped_symbol_area": int(face.get("warped_symbol_area", 0)),
+            "localization": face_loc,
+            "crop_center_xyz_m": face_loc.get("crop_center_xyz_m"),
+            "crop_center_distance_m": face_loc.get("crop_center_distance_m"),
+            "face_center_xyz_m": face_loc.get("face_center_xyz_m"),
+            "face_center_distance_m": face_loc.get("face_center_distance_m"),
+            "distance_delta_m": face_loc.get("distance_delta_m"),
+            "distance_tolerance_m": face_loc.get("distance_tolerance_m"),
+            "distance_ok": bool(face_loc.get("distance_ok", False)),
+        }
+        if artifacts:
+            record.update(artifacts)
+        return record
 
     # ════════════════════════════════════════════════════════════════════════
     # 5. SAVE  (JSON log / cache)
@@ -1134,33 +1540,37 @@ class KFSDetector:
 
         records = []
         for box in self.detect_boxes(rgb, depth, depth_scale):
-            loc = self.find_location(box, intr, depth_scale)
+            loc_info = self.localization_info(box, intr, depth_scale)
+            loc = loc_info["crop_center_xyz_m"]
             faces = self.flatten_faces(box, intr, depth_scale)
             if not faces:
                 continue
             face_results = []
             for face in faces:
-                label, info = self.classify_face(face["image"])
-                face_results.append({
-                    "label": label,
-                    "valid_count": int(info["valid_count"]),
-                    "sharp_end_count": int(info["sharp_end_count"]),
-                    "round_end_count": int(info["round_end_count"]),
-                    "branch_count": int(info["branch_count"]),
-                    "endpoint_count": int(info["endpoint_count"]),
-                    "endpoint_candidates": info.get("endpoint_candidates", []),
-                    "ignored_intersections": info.get("ignored_intersections", []),
-                    "quad": face["quad"],
-                    "method": face["method"],
-                    "clarity_score": float(face["clarity_score"]),
-                    "symbol_area": float(face["symbol_area"]),
-                })
+                label, info = self.classify_face(
+                    face["image"], face.get("symbol_mask"))
+                face_loc = self.face_localization_info(
+                    box, face, intr, depth_scale, loc_info)
+                result = self._face_result_record(face, label, info, face_loc)
+                if result["prediction_accepted"]:
+                    face_results.append({
+                        "label": result["label"],
+                        "confidence": result["confidence"],
+                        "prediction_accepted": True,
+                        "selected_face_score": face.get("selection_score", []),
+                        "selected_symbol_area": face.get("warped_symbol_area", 0),
+                        "selected_quad_area": (
+                            face.get("quad_quality", {}).get("area")),
+                    })
+            if not face_results:
+                continue
             records.append({
                 "frame": frame_idx,
                 "frame_clarity": frame_clarity,
                 "bbox": list(box["bbox"]),
                 "color": box.get("color"),
-                "location_xyz_m": list(loc) if loc else None,
+                "location_xyz_m": loc,
+                "distance_m": loc_info["crop_center_distance_m"],
                 "faces": face_results,
             })
         return records
@@ -1200,139 +1610,95 @@ class KFSDetector:
         frame_clarity = self.clarity_score(rgb)
 
         color_path = out_dir / "color.png"
-        overlay_path = out_dir / "boxes_overlay.png"
+        overlay_path = out_dir / "overlay.png"
 
         cv2.imwrite(str(color_path), rgb)
-        verbose_artifacts = {}
-        if self.debug_verbose:
-            depth_path = out_dir / "depth.png"
-            blue_mask_path = out_dir / "blue_mask.png"
-            red_mask_path = out_dir / "red_mask.png"
-            color_mask_path = out_dir / "color_mask.png"
-            valid_depth_mask_path = out_dir / "valid_depth_mask.png"
-            cv2.imwrite(str(depth_path),
-                        self._depth_visual(depth, depth_scale=depth_scale))
-            masks = self._color_masks(rgb)
-            valid_depth = self._valid_depth_mask(depth, depth_scale)
-            cv2.imwrite(str(blue_mask_path), masks["BLUE"])
-            cv2.imwrite(str(red_mask_path), masks["RED"])
-            cv2.imwrite(str(color_mask_path), masks["ALL"])
-            cv2.imwrite(str(valid_depth_mask_path), valid_depth)
-            verbose_artifacts.update({
-                "depth": self._rel_path(depth_path, out_dir),
-                "blue_mask": self._rel_path(blue_mask_path, out_dir),
-                "red_mask": self._rel_path(red_mask_path, out_dir),
-                "color_mask": self._rel_path(color_mask_path, out_dir),
-                "valid_depth_mask": self._rel_path(valid_depth_mask_path, out_dir),
-            })
 
         overlay = rgb.copy()
         boxes_out = []
         accepted_count = 0
         for box_idx, box in enumerate(self.detect_boxes(rgb, depth, depth_scale)):
-            loc = self.find_location(box, intr, depth_scale)
+            loc_info = self.localization_info(box, intr, depth_scale)
+            loc = loc_info["crop_center_xyz_m"]
+            distance = loc_info["crop_center_distance_m"]
             faces = self.flatten_faces(box, intr, depth_scale)
 
             x, y, w, h = box["bbox"]
             crop_path = out_dir / f"box_{box_idx}_crop.png"
-            quad_path = out_dir / f"box_{box_idx}_face_quad.png"
             cv2.imwrite(str(crop_path), box["rgb_crop"])
 
-            face_results = []
-            face_labels = []
-            for face_idx, face in enumerate(faces):
-                label, info = self.classify_face(face["image"])
-                face_path = out_dir / f"box_{box_idx}_face_{face_idx}.png"
-                endpoints_path = (
-                    out_dir / f"box_{box_idx}_face_{face_idx}_endpoints.png")
-                cv2.imwrite(str(face_path), face["image"])
+            artifacts = {
+                "crop": self._rel_path(crop_path, out_dir),
+            }
+            selected_face = None
+            selected_face_summary = None
+            verdict = "NONE"
+            reject_reason = None
+            status = "rejected"
+
+            if faces:
+                face = faces[0]
+                label, info = self.classify_face(
+                    face["image"], face.get("symbol_mask"))
+                face_loc = self.face_localization_info(
+                    box, face, intr, depth_scale, loc_info)
+
+                selected_face_path = out_dir / f"box_{box_idx}_selected_face.png"
+                flatten_path = out_dir / f"box_{box_idx}_flatten.png"
+                endpoints_path = out_dir / f"box_{box_idx}_endpoints.png"
+                cv2.imwrite(str(selected_face_path),
+                            face.get("selected_face_debug", box["rgb_crop"]))
+                cv2.imwrite(str(flatten_path), face["image"])
                 if "endpoints_image" in info:
                     cv2.imwrite(str(endpoints_path), info["endpoints_image"])
                 else:
                     cv2.imwrite(str(endpoints_path), face["image"])
-                face_labels.append(label)
-                face_results.append({
-                    "label": label,
-                    "valid_count": int(info["valid_count"]),
-                    "n_corners": int(info["n_corners"]),
-                    "sharp_end_count": int(info["sharp_end_count"]),
-                    "round_end_count": int(info["round_end_count"]),
-                    "branch_count": int(info["branch_count"]),
-                    "endpoint_count": int(info["endpoint_count"]),
-                    "endpoint_candidates": info.get("endpoint_candidates", []),
-                    "ignored_intersections": info.get("ignored_intersections", []),
-                    "quad": face["quad"],
-                    "method": face["method"],
-                    "clarity_score": float(face["clarity_score"]),
-                    "symbol_area": float(face["symbol_area"]),
-                    "image_path": self._rel_path(face_path, out_dir),
-                    "endpoints_path": self._rel_path(endpoints_path, out_dir),
+
+                artifacts.update({
+                    "selected_face": self._rel_path(selected_face_path, out_dir),
+                    "flatten": self._rel_path(flatten_path, out_dir),
+                    "endpoints": self._rel_path(endpoints_path, out_dir),
                 })
 
-            if faces:
-                cv2.imwrite(str(quad_path), faces[0]["quad_debug"])
-                status = "accepted"
-                reject_reason = None
-                accepted_count += 1
+                result = self._face_result_record(face, label, info, face_loc)
+                selected_face_summary = {
+                    "label": label,
+                    "confidence": float(info.get("confidence", 0.0)),
+                    "score": face.get("selection_score", []),
+                    "symbol_area": int(face.get("warped_symbol_area", 0)),
+                    "quad_area": face.get("quad_quality", {}).get("area"),
+                    "quad_aspect": face.get("quad_quality", {}).get("aspect"),
+                    "distance_ok": bool(result.get("distance_ok", False)),
+                }
+                selected_face = selected_face_summary
+                if result["prediction_accepted"]:
+                    status = "accepted"
+                    verdict = label
+                    accepted_count += 1
+                elif self._is_predictive_label(label):
+                    reject_reason = "face_distance_mismatch"
+                else:
+                    reject_reason = "no_classifiable_face"
             else:
                 symbol_mask = self._symbol_mask(box["rgb_crop"], box["mask"])
                 groups = self._symbol_groups(symbol_mask)
-                if groups:
-                    color_mask = self._same_color_face_mask(
-                        box["rgb_crop"], box["mask"], box.get("color", "ALL"))
-                    edges = self._face_edges(
-                        box["rgb_crop"], color_mask, symbol_mask)
-                    quad_debug = self._quad_debug_image(
-                        box["rgb_crop"], [], symbol_mask, edges, groups)
-                    reject_reason = "no_flattenable_face"
-                else:
-                    quad_debug = box["rgb_crop"]
-                    reject_reason = "no_symbol_group"
-                cv2.imwrite(str(quad_path), quad_debug)
-                status = "rejected"
-
-            box_artifacts = {
-                "crop": self._rel_path(crop_path, out_dir),
-                "face_quad": self._rel_path(quad_path, out_dir),
-            }
-            if self.debug_verbose:
-                mask_path = out_dir / f"box_{box_idx}_mask.png"
-                object_mask_path = out_dir / f"box_{box_idx}_object_mask.png"
-                box_depth_path = out_dir / f"box_{box_idx}_depth.png"
-                symbol_mask_path = out_dir / f"box_{box_idx}_symbol_mask.png"
-                edges_path = out_dir / f"box_{box_idx}_edges.png"
-                symbol_mask = self._symbol_mask(box["rgb_crop"], box["mask"])
-                color_mask = self._same_color_face_mask(
-                    box["rgb_crop"], box["mask"], box.get("color", "ALL"))
-                cv2.imwrite(str(mask_path), box["mask"])
-                cv2.imwrite(str(object_mask_path), box["mask"])
-                cv2.imwrite(str(box_depth_path),
-                            self._depth_visual(
-                                box["depth_crop"], box["mask"], depth_scale))
-                cv2.imwrite(str(symbol_mask_path), symbol_mask)
-                cv2.imwrite(str(edges_path),
-                            self._face_edges(
-                                box["rgb_crop"], color_mask, symbol_mask))
-                box_artifacts.update({
-                    "mask": self._rel_path(mask_path, out_dir),
-                    "object_mask": self._rel_path(object_mask_path, out_dir),
-                    "depth": self._rel_path(box_depth_path, out_dir),
-                    "symbol_mask": self._rel_path(symbol_mask_path, out_dir),
-                    "edges": self._rel_path(edges_path, out_dir),
-                })
+                reject_reason = "no_flattenable_face" if groups else "no_symbol_group"
 
             if status == "accepted":
                 draw_color = (255, 0, 0) if box.get("color") == "BLUE" else (0, 0, 255)
             else:
                 draw_color = (128, 128, 128)
             cv2.rectangle(overlay, (x, y), (x + w, y + h), draw_color, 2)
+            bx, by = loc_info["crop_center_pixel"]
+            cv2.drawMarker(overlay, (int(round(bx)), int(round(by))),
+                           draw_color, cv2.MARKER_CROSS, 12, 2)
             label_text = f"box {box_idx} {box.get('color', '')}".strip()
             if status == "rejected":
                 label_text += f" rejected:{reject_reason}"
-            elif face_labels:
-                label_text += " " + "/".join(face_labels)
-            if loc:
-                label_text += f" z={loc[2]:.2f}m"
+            else:
+                label_text += f" {verdict}"
+            if loc and distance is not None:
+                label_text += f" z={loc[2]:.2f}m d={distance:.2f}m"
             cv2.putText(overlay, label_text, (x, max(20, y - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_color, 1,
                         cv2.LINE_AA)
@@ -1342,11 +1708,12 @@ class KFSDetector:
                 "bbox": [int(v) for v in box["bbox"]],
                 "color": box.get("color"),
                 "status": status,
+                "verdict": verdict,
                 "reject_reason": reject_reason,
-                "object_depth_m": float(box["object_depth_m"]),
                 "location_xyz_m": [float(v) for v in loc] if loc else None,
-                "faces": face_results,
-                "artifacts": box_artifacts,
+                "distance_m": distance,
+                "selected_face": selected_face,
+                "artifacts": artifacts,
             })
 
         cv2.imwrite(str(overlay_path), overlay)
@@ -1359,31 +1726,14 @@ class KFSDetector:
             "selected_timestamp_s": (
                 float(timestamp_s) if timestamp_s is not None else None
             ),
-            "initial_frame_index": (
-                int(initial_frame_idx) if initial_frame_idx is not None else int(frame_idx)
-            ),
-            "initial_timestamp_s": (
-                float(initial_timestamp_s)
-                if initial_timestamp_s is not None
-                else (float(timestamp_s) if timestamp_s is not None else None)
-            ),
-            "initial_clarity": (
-                float(initial_clarity)
-                if initial_clarity is not None
-                else float(frame_clarity)
-            ),
-            "selected_clarity": float(frame_clarity),
-            "min_frame_clarity": float(self.min_frame_clarity),
-            "skipped_blurry_frames": int(skipped_blurry_frames),
             "n_candidates": int(len(boxes_out)),
             "n_boxes": int(accepted_count),
             "artifacts": {
                 "color": self._rel_path(color_path, out_dir),
-                "boxes_overlay": self._rel_path(overlay_path, out_dir),
+                "overlay": self._rel_path(overlay_path, out_dir),
             },
             "boxes": boxes_out,
         }
-        result["artifacts"].update(verbose_artifacts)
         result_path = out_dir / "result.json"
         self.save(result, result_path)
         return result
@@ -1395,6 +1745,13 @@ class KFSDetector:
             loc = rec["location_xyz_m"]
             if loc is None:
                 continue
+            predictive_faces = [
+                f for f in rec.get("faces", [])
+                if f.get("label") in ("REAL", "FAKE") and
+                f.get("prediction_accepted", True)
+            ]
+            if not predictive_faces:
+                continue
             match = None
             for b in boxes:
                 ref = np.mean(b["locations"], axis=0)
@@ -1405,17 +1762,32 @@ class KFSDetector:
                 match = {"locations": [], "faces": []}
                 boxes.append(match)
             match["locations"].append(loc)
-            match["faces"].extend(rec["faces"])
+            match["faces"].extend(predictive_faces)
         out = []
         for b in boxes:
             center = np.mean(b["locations"], axis=0).tolist()
+            center_distance = self._distance_xyz(center)
             labels = [f["label"] for f in b["faces"]]
-            verdict = "REAL" if labels.count("REAL") >= labels.count("FAKE") else "FAKE"
+            real_votes = [f for f in b["faces"] if f["label"] == "REAL"]
+            fake_votes = [f for f in b["faces"] if f["label"] == "FAKE"]
+            real_score = sum(float(f.get("confidence", 1.0)) for f in real_votes)
+            fake_score = sum(float(f.get("confidence", 1.0)) for f in fake_votes)
+            if real_score > fake_score and real_votes:
+                verdict = "REAL"
+            elif fake_score > real_score and fake_votes:
+                verdict = "FAKE"
+            else:
+                verdict = "NONE"
             out.append({
                 "center_xyz_m": center,
+                "center_distance_m": center_distance,
                 "n_observations": len(b["locations"]),
                 "verdict": verdict,
                 "face_labels": labels,
+                "real_votes": len(real_votes),
+                "fake_votes": len(fake_votes),
+                "real_score": real_score,
+                "fake_score": fake_score,
             })
         return out
 

@@ -8,6 +8,7 @@ Examples
     python run.py --live                         # live RealSense camera
     python run.py --bag clip.bag --out result.json
     python run.py --bag clip.bag --debug-time 38 # inspect one frame in debug/
+    python run.py --bag clip.bag --debug-time 9 15 27
 
 Needs pyrealsense2 (installed on the Jetson) for the camera/.bag source.
 """
@@ -88,10 +89,10 @@ def main():
                    help="frames per second to process "
                         "(default 3 for --bag, full rate for --live)")
     p.add_argument("--out", default="boxes.json", help="output JSON path")
-    p.add_argument("--debug-time", type=float, default=None,
-                   help="process one bag frame at this timestamp in seconds; "
-                        "if it is blurry, use the next clear frame and save "
-                        "debug artifacts under debug/")
+    p.add_argument("--debug-time", type=float, nargs="+", default=None,
+                   help="process one or more bag timestamps in seconds; "
+                        "if a frame is blurry, use the next clear frame and "
+                        "save debug artifacts under debug/")
     args = p.parse_args()
 
     if args.debug_time is not None:
@@ -99,31 +100,33 @@ def main():
             p.error("--debug-time requires --bag")
 
         det = KFSDetector()
-        rec = _debug_bag_frame(args.bag, args.debug_time, det)
-        if rec is None:
-            p.error(f"no aligned color/depth frames found in {args.bag}")
+        for target_s in args.debug_time:
+            rec = _debug_bag_frame(args.bag, target_s, det)
+            if rec is None:
+                p.error(f"no aligned color/depth frames found in {args.bag}")
 
-        out_dir = _make_debug_dir(args.debug_time)
-        result = det.debug_process_frame(
-            rec["rgb"],
-            rec["depth"],
-            rec["intrinsics"],
-            rec["depth_scale"],
-            frame_idx=rec["frame_index"],
-            timestamp_s=rec["timestamp_s"],
-            requested_time_s=args.debug_time,
-            out_dir=out_dir,
-            initial_frame_idx=rec["initial_frame_index"],
-            initial_timestamp_s=rec["initial_timestamp_s"],
-            initial_clarity=rec["initial_clarity"],
-            skipped_blurry_frames=rec["skipped_blurry_frames"],
-        )
-        print(f"\nDebug frame saved to {out_dir}")
-        print(f"Requested {args.debug_time:.3f}s, selected "
-              f"{rec['timestamp_s']:.3f}s at frame {rec['frame_index']}")
-        print(f"Clarity {rec['clarity']:.1f} "
-              f"(skipped {rec['skipped_blurry_frames']} blurry frame(s))")
-        print(f"Found {result['n_boxes']} box(es). Result: {out_dir / 'result.json'}")
+            out_dir = _make_debug_dir(target_s)
+            result = det.debug_process_frame(
+                rec["rgb"],
+                rec["depth"],
+                rec["intrinsics"],
+                rec["depth_scale"],
+                frame_idx=rec["frame_index"],
+                timestamp_s=rec["timestamp_s"],
+                requested_time_s=target_s,
+                out_dir=out_dir,
+                initial_frame_idx=rec["initial_frame_index"],
+                initial_timestamp_s=rec["initial_timestamp_s"],
+                initial_clarity=rec["initial_clarity"],
+                skipped_blurry_frames=rec["skipped_blurry_frames"],
+            )
+            print(f"\nDebug frame saved to {out_dir}")
+            print(f"Requested {target_s:.3f}s, selected "
+                  f"{rec['timestamp_s']:.3f}s at frame {rec['frame_index']}")
+            print(f"Clarity {rec['clarity']:.1f} "
+                  f"(skipped {rec['skipped_blurry_frames']} blurry frame(s))")
+            print(f"Found {result['n_boxes']} accepted box(es). "
+                  f"Result: {out_dir / 'result.json'}")
         return
 
     source = RealSenseSource(testing=bool(args.bag), bag_path=args.bag,
@@ -134,8 +137,10 @@ def main():
     print(f"\nFound {len(boxes)} box(es). Results saved to {args.out}")
     for i, b in enumerate(boxes):
         x, y, z = b["center_xyz_m"]
+        d = b.get("center_distance_m")
+        dist_text = f" d={d:.2f}m" if d is not None else ""
         print(f"  box {i}: {b['verdict']:4}  at ({x:.2f}, {y:.2f}, {z:.2f}) m  "
-              f"seen {b['n_observations']}x")
+              f"{dist_text} seen {b['n_observations']}x")
 
 
 if __name__ == "__main__":
